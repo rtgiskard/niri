@@ -163,6 +163,11 @@ enum CastState {
     },
 }
 
+struct FrameDamage {
+    states: RenderElementStates,
+    redraw_cursor: bool,
+}
+
 #[derive(PartialEq, Eq)]
 pub enum CastSizeChange {
     Ready,
@@ -1129,10 +1134,6 @@ impl Cast {
         }
     }
 
-    fn dequeue_available_buffer(&mut self) -> Option<NonNull<pw_buffer>> {
-        unsafe { NonNull::new(self.stream.dequeue_raw_buffer()) }
-    }
-
     fn queue_completed_buffers(&mut self) {
         let mut inner = self.inner.borrow_mut();
 
@@ -1211,126 +1212,80 @@ impl Cast {
     pub fn dequeue_buffer_and_render(
         &mut self,
         renderer: &mut GlesRenderer,
-        mut elements: &[CastRenderElement<GlesRenderer>],
+        elements: &[CastRenderElement<GlesRenderer>],
         cursor_data: &CursorData<CastRenderElement<GlesRenderer>>,
         size: Size<i32, Physical>,
         scale: Scale<f64>,
     ) -> bool {
         let mut inner = self.inner.borrow_mut();
 
-        let CastState::Ready {
-            damage_tracker,
-            cursor_damage_tracker,
-            last_cursor_location,
-            ..
-        } = &mut inner.state
-        else {
-            error!("cast must be in Ready state to render");
+        let Some((pw_buffer, damage)) = inner.state.prepare_buffer(
+            || unsafe { NonNull::new(self.stream.dequeue_raw_buffer()) },
+            elements,
+            cursor_data,
+            self.cursor_mode,
+            size,
+            scale,
+        ) else {
             return false;
         };
-        let damage_tracker = damage_tracker
-            .get_or_insert_with(|| OutputDamageTracker::new(size, scale, Transform::Normal));
-        let cursor_damage_tracker = cursor_damage_tracker.get_or_insert_with(|| {
-            OutputDamageTracker::new(
-                Size::from((CURSOR_WIDTH as _, CURSOR_HEIGHT as _)),
-                scale,
-                Transform::Normal,
-            )
-        });
+        let FrameDamage {
+            states,
+            redraw_cursor,
+        } = damage;
 
-        // Size change will drop the damage tracker, but scale change won't, so check it here.
-        let OutputModeSource::Static { scale: t_scale, .. } = damage_tracker.mode() else {
-            unreachable!();
-        };
-        if *t_scale != scale {
-            *damage_tracker = OutputDamageTracker::new(size, scale, Transform::Normal);
-            *cursor_damage_tracker = OutputDamageTracker::new(
-                Size::from((CURSOR_WIDTH as _, CURSOR_HEIGHT as _)),
-                scale,
-                Transform::Normal,
-            );
-        }
-
-        let mut has_cursor_update = false;
-        let mut redraw_cursor = false;
-
-        // For embedded cursor, pass the full slice (cursor + main) to the damage tracker.
-        // For metadata or hidden cursor, pass only the main elements.
-        if self.cursor_mode == CursorMode::Metadata || self.cursor_mode == CursorMode::Hidden {
-            elements = &elements[cursor_data.elem_count..];
-        }
-        let (damage, states) = damage_tracker.damage_output(1, elements).unwrap();
-
-        if self.cursor_mode == CursorMode::Metadata {
-            let (damage, _states) = cursor_damage_tracker
-                .damage_output(1, &cursor_data.relocated)
-                .unwrap();
-            redraw_cursor = damage.is_some();
-            has_cursor_update =
-                redraw_cursor || *last_cursor_location != Some(cursor_data.location);
-        }
-
-        if damage.is_none() && !has_cursor_update {
-            trace!("no damage, skipping frame");
-            return false;
-        }
-        *last_cursor_location = Some(cursor_data.location);
-        drop(inner);
-
-        let Some(pw_buffer) = self.dequeue_available_buffer() else {
-            warn!("no available buffer in pw stream, skipping frame");
-            return false;
+        // For embedded cursor, render the full slice (cursor + main). Metadata and hidden
+        // cursor modes only render the main elements into the video buffer.
+        let elements = if self.cursor_mode == CursorMode::Embedded {
+            elements
+        } else {
+            &elements[cursor_data.elem_count..]
         };
         let buffer = pw_buffer.as_ptr();
 
-        let mut inner = self.inner.borrow_mut();
-        let inner_ = &mut *inner;
-        let CastState::Ready {
-            damage_tracker,
-            alpha,
+        let CastInner {
+            state,
+            dmabufs,
+            shmbufs,
             ..
-        } = &mut inner_.state
-        else {
+        } = &mut *inner;
+        let CastState::Ready { alpha, .. } = state else {
             unreachable!()
         };
-        let damage_tracker = damage_tracker.as_mut().unwrap();
         let alpha = *alpha;
 
         unsafe {
             let spa_buffer = (*buffer).buffer;
-
-            if self.cursor_mode == CursorMode::Metadata {
-                add_cursor_metadata(renderer, spa_buffer, cursor_data, redraw_cursor);
-            }
-
-            // FIXME: would be good to skip rendering the full frame if only the pointer changed.
-            // Unfortunately, I think the OBS PipeWire code needs to be updated first to cleanly
-            // allow for that codepath.
-            let fd = (*(*spa_buffer).datas).fd;
-
-            let res = match (*(*spa_buffer).datas).type_ {
-                x if x == DataType::DmaBuf.as_raw() => {
-                    let dmabuf = inner_.dmabufs[&fd].clone();
-                    render_to_dmabuf(renderer, damage_tracker, dmabuf, elements, states)
-                        .map(|x| (x, SharingBuf::Dma))
+            let res = state.render_frame(cursor_data.location, |damage_tracker| {
+                if self.cursor_mode == CursorMode::Metadata {
+                    add_cursor_metadata(renderer, spa_buffer, cursor_data, redraw_cursor)?;
                 }
-                x if x == DataType::MemFd.as_raw() => {
-                    let shmbuf = &inner_.shmbufs[&fd];
 
-                    let fourcc = if alpha {
-                        Fourcc::Argb8888
-                    } else {
-                        Fourcc::Xrgb8888
-                    };
+                // FIXME: would be good to skip rendering the full frame if only the pointer
+                // changed. OBS PipeWire needs to be updated first to allow that cleanly.
+                let fd = (*(*spa_buffer).datas).fd;
+                match (*(*spa_buffer).datas).type_ {
+                    x if x == DataType::DmaBuf.as_raw() => {
+                        let dmabuf = dmabufs[&fd].clone();
+                        render_to_dmabuf(renderer, damage_tracker, dmabuf, elements, states)
+                            .map(|x| (x, SharingBuf::Dma))
+                    }
+                    x if x == DataType::MemFd.as_raw() => {
+                        let shmbuf = &shmbufs[&fd];
+                        let fourcc = if alpha {
+                            Fourcc::Argb8888
+                        } else {
+                            Fourcc::Xrgb8888
+                        };
 
-                    render_to_shmbuf(renderer, damage_tracker, shmbuf, fourcc, elements, states)
-                        .map(|()| (SyncPoint::signaled(), SharingBuf::Shm(shmbuf.layout)))
+                        render_to_shmbuf(renderer, damage_tracker, shmbuf, fourcc, elements, states)
+                            .map(|()| (SyncPoint::signaled(), SharingBuf::Shm(shmbuf.layout)))
+                    }
+                    _ => Err(anyhow::anyhow!(
+                        "unknown data type in dequeue_buffer_and_render"
+                    )),
                 }
-                _ => Err(anyhow::anyhow!(
-                    "unknown data type in dequeue_buffer_and_render"
-                )),
-            };
-
+            });
             drop(inner);
             match res {
                 Ok((sync_point, buf)) => {
@@ -1349,31 +1304,24 @@ impl Cast {
     }
 
     pub fn dequeue_buffer_and_clear(&mut self, renderer: &mut GlesRenderer) -> bool {
-        let mut inner = self.inner.borrow_mut();
-
-        // Clear out the damage tracker if we're in Ready state.
-        if let CastState::Ready {
-            damage_tracker,
-            cursor_damage_tracker,
-            ..
-        } = &mut inner.state
-        {
-            *damage_tracker = None;
-            *cursor_damage_tracker = None;
-        };
-        drop(inner);
-
-        let Some(pw_buffer) = self.dequeue_available_buffer() else {
+        let Some(pw_buffer) = (unsafe { NonNull::new(self.stream.dequeue_raw_buffer()) }) else {
             warn!("no available buffer in pw stream, skipping frame");
             return false;
         };
+
+        // A clear replaces the content tracked by both trackers, including cursor metadata.
+        self.inner.borrow_mut().state.invalidate_damage();
         let buffer = pw_buffer.as_ptr();
 
         unsafe {
             let spa_buffer = (*buffer).buffer;
 
             if self.cursor_mode == CursorMode::Metadata {
-                add_invisible_cursor(spa_buffer);
+                if let Err(err) = add_invisible_cursor(spa_buffer) {
+                    warn!("error adding invisible cursor metadata: {err:?}");
+                    return_unused_buffer(&self.stream, pw_buffer);
+                    return false;
+                }
             }
 
             let fd = (*(*spa_buffer).datas).fd;
@@ -1548,6 +1496,130 @@ impl CastInner {
 }
 
 impl CastState {
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_buffer<E: Element>(
+        &mut self,
+        dequeue: impl FnOnce() -> Option<NonNull<pw_buffer>>,
+        elements: &[E],
+        cursor_data: &CursorData<E>,
+        cursor_mode: CursorMode,
+        size: Size<i32, Physical>,
+        scale: Scale<f64>,
+    ) -> Option<(NonNull<pw_buffer>, FrameDamage)> {
+        let Self::Ready {
+            damage_tracker,
+            cursor_damage_tracker,
+            last_cursor_location,
+            ..
+        } = self
+        else {
+            error!("cast must be in Ready state to render");
+            return None;
+        };
+
+        let damage_tracker = damage_tracker
+            .get_or_insert_with(|| OutputDamageTracker::new(size, scale, Transform::Normal));
+        let cursor_damage_tracker = cursor_damage_tracker.get_or_insert_with(|| {
+            OutputDamageTracker::new(
+                Size::from((CURSOR_WIDTH as _, CURSOR_HEIGHT as _)),
+                scale,
+                Transform::Normal,
+            )
+        });
+
+        // Size changes drop the trackers, but scale changes do not.
+        let OutputModeSource::Static { scale: t_scale, .. } = damage_tracker.mode() else {
+            unreachable!();
+        };
+        if *t_scale != scale {
+            *damage_tracker = OutputDamageTracker::new(size, scale, Transform::Normal);
+            *cursor_damage_tracker = OutputDamageTracker::new(
+                Size::from((CURSOR_WIDTH as _, CURSOR_HEIGHT as _)),
+                scale,
+                Transform::Normal,
+            );
+        }
+
+        let main_elements = if cursor_mode == CursorMode::Embedded {
+            elements
+        } else {
+            &elements[cursor_data.elem_count..]
+        };
+        let (damage, states) = damage_tracker.damage_output(1, main_elements).unwrap();
+        let has_damage = damage.is_some();
+        let mut redraw_cursor = false;
+        let mut has_cursor_update = false;
+        if cursor_mode == CursorMode::Metadata {
+            let (damage, _states) = cursor_damage_tracker
+                .damage_output(1, &cursor_data.relocated)
+                .unwrap();
+            redraw_cursor = damage.is_some();
+            has_cursor_update =
+                redraw_cursor || *last_cursor_location != Some(cursor_data.location);
+        }
+
+        if !has_damage && !has_cursor_update {
+            trace!("no damage, skipping frame");
+            return None;
+        }
+
+        // damage_output() provisionally retires damage. If no buffer can accept this
+        // update, invalidate both trackers so the next attempt resends the full frame.
+        // Dequeue only after detecting damage: returning an unchanged buffer by queueing
+        // a corrupted frame can make latest-buffer consumers discard an older valid frame.
+        let Some(buffer) = dequeue() else {
+            warn!("no available buffer in pw stream, skipping frame");
+            self.invalidate_damage();
+            return None;
+        };
+
+        Some((
+            buffer,
+            FrameDamage {
+                states,
+                redraw_cursor,
+            },
+        ))
+    }
+
+    fn render_frame<T>(
+        &mut self,
+        cursor_location: Point<i32, Physical>,
+        render: impl FnOnce(&mut OutputDamageTracker) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let Self::Ready {
+            damage_tracker,
+            last_cursor_location,
+            ..
+        } = self
+        else {
+            unreachable!();
+        };
+        let result = render(damage_tracker.as_mut().unwrap());
+        if result.is_ok() {
+            *last_cursor_location = Some(cursor_location);
+        } else {
+            // damage_output() already retired both trackers' damage, but nothing was
+            // submitted. Report full damage next time, including a static cursor bitmap.
+            self.invalidate_damage();
+        }
+        result
+    }
+
+    fn invalidate_damage(&mut self) {
+        if let Self::Ready {
+            damage_tracker,
+            cursor_damage_tracker,
+            last_cursor_location,
+            ..
+        } = self
+        {
+            *damage_tracker = None;
+            *cursor_damage_tracker = None;
+            *last_cursor_location = None;
+        }
+    }
+
     fn pending_size(&self) -> Option<Size<u32, Physical>> {
         match self {
             CastState::ResizePending { pending_size } => Some(*pending_size),
@@ -1703,6 +1775,11 @@ fn allocate_shmbuf(size: Size<u32, Physical>) -> anyhow::Result<Shmbuf> {
 unsafe fn return_unused_buffer(stream: &Stream, pw_buffer: NonNull<pw_buffer>) {
     // pw_stream_return_buffer() requires too new PipeWire (1.4.0). So, mark as
     // corrupted and queue.
+    mark_buffer_as_corrupted(pw_buffer);
+    pw_stream_queue_buffer(stream.as_raw_ptr(), pw_buffer.as_ptr());
+}
+
+unsafe fn mark_buffer_as_corrupted(pw_buffer: NonNull<pw_buffer>) {
     let pw_buffer = pw_buffer.as_ptr();
     let spa_buffer = (*pw_buffer).buffer;
     let chunk = (*(*spa_buffer).datas).chunk;
@@ -1715,7 +1792,18 @@ unsafe fn return_unused_buffer(stream: &Stream, pw_buffer: NonNull<pw_buffer>) {
         (*header).flags = SPA_META_HEADER_FLAG_CORRUPTED;
     }
 
-    pw_stream_queue_buffer(stream.as_raw_ptr(), pw_buffer);
+    // Even consumers that inspect cursor metadata on an empty frame must not apply a stale
+    // bitmap left over from the previous use of this buffer.
+    let cursor: *mut spa_meta_cursor = spa_buffer_find_meta_data(
+        spa_buffer,
+        SPA_META_Cursor,
+        mem::size_of::<spa_meta_cursor>(),
+    )
+    .cast();
+    if let Some(cursor) = cursor.as_mut() {
+        cursor.id = 0;
+        cursor.bitmap_offset = 0;
+    }
 }
 
 unsafe fn mark_buffer_as_good(pw_buffer: NonNull<pw_buffer>, sequence: &mut u64, buf: SharingBuf) {
@@ -1763,17 +1851,13 @@ unsafe fn find_meta_header(buffer: *mut spa_buffer) -> Option<NonNull<spa_meta_h
     NonNull::new(p)
 }
 
-unsafe fn add_invisible_cursor(spa_buffer: *mut spa_buffer) {
+unsafe fn add_invisible_cursor(spa_buffer: *mut spa_buffer) -> anyhow::Result<()> {
     unsafe {
-        let cursor_meta_ptr: *mut spa_meta_cursor = spa_buffer_find_meta_data(
-            spa_buffer,
-            SPA_META_Cursor,
-            mem::size_of::<spa_meta_cursor>(),
-        )
-        .cast();
-        let Some(cursor_meta) = cursor_meta_ptr.as_mut() else {
-            return;
-        };
+        let cursor_meta_ptr: *mut spa_meta_cursor =
+            spa_buffer_find_meta_data(spa_buffer, SPA_META_Cursor, CURSOR_META_SIZE).cast();
+        let cursor_meta = cursor_meta_ptr
+            .as_mut()
+            .context("missing or undersized cursor metadata")?;
 
         // The cursor is present but invisible.
         cursor_meta.id = 1;
@@ -1808,6 +1892,7 @@ unsafe fn add_invisible_cursor(spa_buffer: *mut spa_buffer) {
         let bitmap_slice = slice::from_raw_parts_mut(bitmap_data, CURSOR_BITMAP_SIZE);
         bitmap_slice[..4].copy_from_slice(&[0, 0, 0, 0]);
     }
+    Ok(())
 }
 
 unsafe fn add_cursor_metadata(
@@ -1815,57 +1900,8 @@ unsafe fn add_cursor_metadata(
     spa_buffer: *mut spa_buffer,
     cursor_data: &CursorData<impl RenderElement<GlesRenderer>>,
     redraw: bool,
-) {
-    unsafe {
-        let cursor_meta_ptr: *mut spa_meta_cursor = spa_buffer_find_meta_data(
-            spa_buffer,
-            SPA_META_Cursor,
-            mem::size_of::<spa_meta_cursor>(),
-        )
-        .cast();
-        let Some(cursor_meta) = cursor_meta_ptr.as_mut() else {
-            return;
-        };
-
-        cursor_meta.id = 1;
-        cursor_meta.position.x = cursor_data.location.x;
-        cursor_meta.position.y = cursor_data.location.y;
-        cursor_meta.hotspot.x = cursor_data.hotspot.x;
-        cursor_meta.hotspot.y = cursor_data.hotspot.y;
-
-        if !redraw {
-            trace!("cursor not damaged, skipping rerendering");
-            cursor_meta.bitmap_offset = 0;
-            return;
-        }
-
-        cursor_meta.bitmap_offset = BITMAP_META_OFFSET as _;
-
-        let bitmap_meta_ptr = cursor_meta_ptr
-            .byte_add(BITMAP_META_OFFSET)
-            .cast::<spa_meta_bitmap>();
-        let bitmap_meta = &mut *bitmap_meta_ptr;
-
-        // Start with a 1x1 transparent pixel; see comment in add_invisible_cursor().
-        bitmap_meta.offset = BITMAP_DATA_OFFSET as _;
-        bitmap_meta.size.width = 1;
-        bitmap_meta.size.height = 1;
-        bitmap_meta.stride = CURSOR_BPP as i32;
-        bitmap_meta.format = CURSOR_FORMAT;
-
-        let bitmap_data = bitmap_meta_ptr.cast::<u8>().add(BITMAP_DATA_OFFSET);
-        let bitmap_slice = slice::from_raw_parts_mut(bitmap_data, CURSOR_BITMAP_SIZE);
-        bitmap_slice[..4].copy_from_slice(&[0, 0, 0, 0]);
-
-        let size = Size::new(
-            min(cursor_data.size.w, CURSOR_WIDTH as i32),
-            min(cursor_data.size.h, CURSOR_HEIGHT as i32),
-        );
-        if size.w == 0 || size.h == 0 {
-            trace!("cursor is invisible, skipping rendering");
-            return;
-        }
-
+) -> anyhow::Result<()> {
+    write_cursor_metadata(spa_buffer, cursor_data, redraw, |size, bitmap| {
         let _span = tracy_client::span!("add_cursor_metadata render cursor");
 
         // FIXME: use a reliable buffer whenever we're rendering the cursor.
@@ -1875,35 +1911,80 @@ unsafe fn add_cursor_metadata(
         //
         // Reliable buffers should be available starting from 1.6.0:
         // https://gitlab.freedesktop.org/pipewire/pipewire/-/issues/4885
-        let mapping = match render_and_download(
+        let mapping = render_and_download(
             renderer,
             size,
             cursor_data.scale,
             Transform::Normal,
             Fourcc::Argb8888,
             cursor_data.relocated.iter().rev(),
-        ) {
-            Ok(mapping) => mapping,
-            Err(err) => {
-                warn!("error rendering cursor: {err:?}");
-                return;
-            }
-        };
-        let pixels = match renderer.map_texture(&mapping) {
-            Ok(pixels) => pixels,
-            Err(err) => {
-                warn!("error mapping cursor texture: {err:?}");
-                return;
-            }
+        )
+        .context("error rendering cursor")?;
+        let pixels = renderer
+            .map_texture(&mapping)
+            .context("error mapping cursor texture")?;
+        bitmap[..pixels.len()].copy_from_slice(pixels);
+        Ok(())
+    })
+}
+
+unsafe fn write_cursor_metadata<E>(
+    spa_buffer: *mut spa_buffer,
+    cursor_data: &CursorData<E>,
+    redraw: bool,
+    render_bitmap: impl FnOnce(Size<i32, Physical>, &mut [u8]) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let meta_size = if redraw {
+        CURSOR_META_SIZE
+    } else {
+        mem::size_of::<spa_meta_cursor>()
+    };
+    let cursor_meta_ptr: *mut spa_meta_cursor =
+        spa_buffer_find_meta_data(spa_buffer, SPA_META_Cursor, meta_size).cast();
+    let cursor_meta = cursor_meta_ptr
+        .as_mut()
+        .context("missing or undersized cursor metadata")?;
+
+    // A bitmap offset of zero tells the consumer to retain its previous bitmap. Only publish
+    // a replacement after rendering and mapping it succeeded; never publish a placeholder.
+    cursor_meta.bitmap_offset = 0;
+    if redraw {
+        let bitmap_meta_ptr = cursor_meta_ptr
+            .byte_add(BITMAP_META_OFFSET)
+            .cast::<spa_meta_bitmap>();
+        let bitmap_data = bitmap_meta_ptr.cast::<u8>().add(BITMAP_DATA_OFFSET);
+        let bitmap_slice = slice::from_raw_parts_mut(bitmap_data, CURSOR_BITMAP_SIZE);
+        let size = Size::new(
+            min(cursor_data.size.w, CURSOR_WIDTH as i32),
+            min(cursor_data.size.h, CURSOR_HEIGHT as i32),
+        );
+        let size = if size.w == 0 || size.h == 0 {
+            // A 1x1 transparent pixel hides the cursor in OBS and libwebrtc; see
+            // add_invisible_cursor(). This is a real invisible cursor, not an error fallback.
+            bitmap_slice[..4].fill(0);
+            Size::from((1, 1))
+        } else {
+            render_bitmap(size, bitmap_slice)?;
+            size
         };
 
-        bitmap_slice[..pixels.len()].copy_from_slice(pixels);
-
-        // Fill the metadata now that everything succeeded.
+        let bitmap_meta = &mut *bitmap_meta_ptr;
+        bitmap_meta.offset = BITMAP_DATA_OFFSET as _;
         bitmap_meta.size.width = size.w as _;
         bitmap_meta.size.height = size.h as _;
         bitmap_meta.stride = size.w * CURSOR_BPP as i32;
+        bitmap_meta.format = CURSOR_FORMAT;
+        cursor_meta.bitmap_offset = BITMAP_META_OFFSET as _;
+    } else {
+        trace!("cursor not damaged, skipping rerendering");
     }
+
+    cursor_meta.id = 1;
+    cursor_meta.position.x = cursor_data.location.x;
+    cursor_meta.position.y = cursor_data.location.y;
+    cursor_meta.hotspot.x = cursor_data.hotspot.x;
+    cursor_meta.hotspot.y = cursor_data.hotspot.y;
+    Ok(())
 }
 
 fn render_to_shmbuf(
@@ -1940,6 +2021,382 @@ fn clear_shmbuf(buffer: &Shmbuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smithay::backend::renderer::element::Kind;
+
+    use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+
+    struct TestBuffer {
+        _cursor_storage: Box<[u64]>,
+        metas: Box<[spa_meta; 2]>,
+        header: Box<spa_meta_header>,
+        chunk: Box<spa_chunk>,
+        _data: Box<spa_data>,
+        spa: Box<spa_buffer>,
+        pw: Box<pw_buffer>,
+    }
+
+    impl TestBuffer {
+        fn new() -> Self {
+            // SPA metadata must be aligned; keep all pointees heap-owned and stationary.
+            let mut cursor_storage = vec![0u64; CURSOR_META_SIZE.div_ceil(8)].into_boxed_slice();
+            let mut header: Box<spa_meta_header> = Box::new(unsafe { mem::zeroed() });
+            let mut metas = Box::new([
+                spa_meta {
+                    type_: SPA_META_Cursor,
+                    size: CURSOR_META_SIZE as _,
+                    data: cursor_storage.as_mut_ptr().cast(),
+                },
+                spa_meta {
+                    type_: SPA_META_Header,
+                    size: mem::size_of::<spa_meta_header>() as _,
+                    data: (&mut *header as *mut spa_meta_header).cast(),
+                },
+            ]);
+            let mut chunk: Box<spa_chunk> = Box::new(unsafe { mem::zeroed() });
+            let mut data: Box<spa_data> = Box::new(unsafe { mem::zeroed() });
+            data.chunk = &mut *chunk;
+            let mut spa = Box::new(spa_buffer {
+                n_metas: metas.len() as _,
+                n_datas: 1,
+                metas: metas.as_mut_ptr(),
+                datas: &mut *data,
+            });
+            let mut pw: Box<pw_buffer> = Box::new(unsafe { mem::zeroed() });
+            pw.buffer = &mut *spa;
+            Self {
+                _cursor_storage: cursor_storage,
+                metas,
+                header,
+                chunk,
+                _data: data,
+                spa,
+                pw,
+            }
+        }
+
+        fn ptr(&mut self) -> NonNull<pw_buffer> {
+            NonNull::from(&mut *self.pw)
+        }
+
+        fn cursor(&self) -> &spa_meta_cursor {
+            unsafe { &*self.metas[0].data.cast::<spa_meta_cursor>() }
+        }
+
+        fn mark_good(&mut self, sequence: &mut u64) {
+            unsafe { mark_buffer_as_good(self.ptr(), sequence, SharingBuf::Dma) };
+        }
+
+        fn discard(&mut self) {
+            unsafe { mark_buffer_as_corrupted(self.ptr()) };
+        }
+    }
+
+    #[derive(Default)]
+    struct CursorConsumer {
+        pixels: Vec<u8>,
+        location: Point<i32, Physical>,
+    }
+
+    impl CursorConsumer {
+        fn consume(&mut self, buffer: &TestBuffer) -> bool {
+            if buffer.chunk.size == 0
+                || buffer.chunk.flags & SPA_CHUNK_FLAG_CORRUPTED as i32 != 0
+                || buffer.header.flags & SPA_META_HEADER_FLAG_CORRUPTED != 0
+            {
+                return false;
+            }
+            let cursor = buffer.cursor();
+            if cursor.id == 0 {
+                return true;
+            }
+            self.location = Point::from((cursor.position.x, cursor.position.y));
+            // This is the consumer contract: bitmap_offset == 0 retains the last bitmap,
+            // even if this buffer happened to carry some other bitmap on its previous use.
+            if cursor.bitmap_offset != 0 {
+                unsafe {
+                    let bitmap = (cursor as *const spa_meta_cursor)
+                        .byte_add(cursor.bitmap_offset as usize)
+                        .cast::<spa_meta_bitmap>();
+                    assert_eq!((*bitmap).format, CURSOR_FORMAT);
+                    let data = bitmap.cast::<u8>().add((*bitmap).offset as usize);
+                    let len = (*bitmap).stride as usize * (*bitmap).size.height as usize;
+                    self.pixels = slice::from_raw_parts(data, len).to_vec();
+                }
+            }
+            true
+        }
+    }
+
+    fn ready_state() -> CastState {
+        CastState::Ready {
+            size: Size::from((32, 32)),
+            alpha: true,
+            dma_negotiation: None,
+            damage_tracker: None,
+            cursor_damage_tracker: None,
+            last_cursor_location: None,
+        }
+    }
+
+    fn scene(
+        cursor: &SolidColorBuffer,
+        main: &SolidColorBuffer,
+        location: Point<f64, Logical>,
+    ) -> [SolidColorRenderElement; 2] {
+        [
+            SolidColorRenderElement::from_buffer(cursor, location, 1., Kind::Unspecified),
+            SolidColorRenderElement::from_buffer(main, (0., 0.), 1., Kind::Unspecified),
+        ]
+    }
+
+    fn prepare_metadata(
+        state: &mut CastState,
+        buffer: &mut TestBuffer,
+        elements: &[SolidColorRenderElement],
+        cursor: &CursorData<SolidColorRenderElement>,
+        available: bool,
+    ) -> Option<(NonNull<pw_buffer>, FrameDamage)> {
+        state.prepare_buffer(
+            || available.then(|| buffer.ptr()),
+            elements,
+            cursor,
+            CursorMode::Metadata,
+            Size::from((32, 32)),
+            Scale::from(1.),
+        )
+    }
+
+    fn fill_bitmap(size: Size<i32, Physical>, bitmap: &mut [u8], pixel: [u8; 4]) {
+        let len = size.w as usize * size.h as usize * CURSOR_BPP as usize;
+        for dest in bitmap[..len].chunks_exact_mut(4) {
+            dest.copy_from_slice(&pixel);
+        }
+    }
+
+    fn publish_cursor(
+        state: &mut CastState,
+        buffer: &mut TestBuffer,
+        cursor: &CursorData<SolidColorRenderElement>,
+        damage: FrameDamage,
+        pixel: [u8; 4],
+        sequence: &mut u64,
+    ) {
+        state
+            .render_frame(cursor.location, |_| unsafe {
+                write_cursor_metadata(
+                    &mut *buffer.spa,
+                    cursor,
+                    damage.redraw_cursor,
+                    |size, dst| {
+                        fill_bitmap(size, dst, pixel);
+                        Ok(())
+                    },
+                )
+            })
+            .unwrap();
+        buffer.mark_good(sequence);
+    }
+
+    #[test]
+    fn static_cursor_bitmap_retries_after_unavailable_buffer() {
+        let mut state = ready_state();
+        let mut buffer = TestBuffer::new();
+        let mut consumer = CursorConsumer::default();
+        let mut sequence = 0;
+        let mut cursor_buffer = SolidColorBuffer::new((2., 2.), [1., 0., 0., 1.]);
+        let main = SolidColorBuffer::new((32., 32.), [0., 0., 0., 1.]);
+        let location = Point::from((8., 8.));
+        let elements = scene(&cursor_buffer, &main, location);
+        let cursor = CursorData::compute(&elements, 1, location, Scale::from(1.));
+        let (_, damage) =
+            prepare_metadata(&mut state, &mut buffer, &elements, &cursor, true).unwrap();
+        publish_cursor(
+            &mut state,
+            &mut buffer,
+            &cursor,
+            damage,
+            [0, 0, 255, 255],
+            &mut sequence,
+        );
+        assert!(consumer.consume(&buffer));
+        assert_eq!(consumer.pixels, [0, 0, 255, 255].repeat(4));
+
+        // Same element identity and geometry, one real commit changing a static bitmap.
+        cursor_buffer.set_color([0., 0., 1., 1.]);
+        let elements = scene(&cursor_buffer, &main, location);
+        let cursor = CursorData::compute(&elements, 1, location, Scale::from(1.));
+        assert!(prepare_metadata(&mut state, &mut buffer, &elements, &cursor, false).is_none());
+        assert_eq!(consumer.pixels, [0, 0, 255, 255].repeat(4));
+
+        // No second cursor commit: the stream must still deliver the same pending bitmap.
+        let (_, damage) =
+            prepare_metadata(&mut state, &mut buffer, &elements, &cursor, true).unwrap();
+        assert!(damage.redraw_cursor);
+        publish_cursor(
+            &mut state,
+            &mut buffer,
+            &cursor,
+            damage,
+            [255, 0, 0, 255],
+            &mut sequence,
+        );
+        assert!(consumer.consume(&buffer));
+        assert_eq!(consumer.pixels, [255, 0, 0, 255].repeat(4));
+        assert_eq!(sequence, 2);
+
+        // An unchanged redraw must not publish even a corrupted frame: a latest-buffer
+        // receiver could select it over the valid frame that has not been consumed yet.
+        assert!(prepare_metadata(&mut state, &mut buffer, &elements, &cursor, true).is_none());
+        assert!(consumer.consume(&buffer));
+        assert_eq!(consumer.pixels, [255, 0, 0, 255].repeat(4));
+        assert_eq!(sequence, 2);
+
+        // Position-only transitions also remain pending after buffer exhaustion.
+        let moved = Point::from((16., 16.));
+        let elements = scene(&cursor_buffer, &main, moved);
+        let cursor = CursorData::compute(&elements, 1, moved, Scale::from(1.));
+        assert!(prepare_metadata(&mut state, &mut buffer, &elements, &cursor, false).is_none());
+        let (_, damage) =
+            prepare_metadata(&mut state, &mut buffer, &elements, &cursor, true).unwrap();
+        assert!(
+            damage.redraw_cursor,
+            "buffer exhaustion invalidates both trackers"
+        );
+        publish_cursor(
+            &mut state,
+            &mut buffer,
+            &cursor,
+            damage,
+            [255, 0, 0, 255],
+            &mut sequence,
+        );
+        assert!(consumer.consume(&buffer));
+        assert_eq!(consumer.location, Point::from((16, 16)));
+        assert_eq!(consumer.pixels, [255, 0, 0, 255].repeat(4));
+    }
+
+    #[test]
+    fn static_cursor_bitmap_retries_after_frame_failure() {
+        // Fail cursor bitmap generation itself, then fail the main frame after a valid
+        // bitmap. Both paths must discard the buffer and retry the same static transition.
+        for fail_bitmap in [true, false] {
+            let mut state = ready_state();
+            let mut buffer = TestBuffer::new();
+            let mut consumer = CursorConsumer::default();
+            let mut sequence = 0;
+            let mut cursor_buffer = SolidColorBuffer::new((2., 2.), [1., 0., 0., 1.]);
+            let main = SolidColorBuffer::new((32., 32.), [0., 0., 0., 1.]);
+            let location = Point::from((8., 8.));
+            let elements = scene(&cursor_buffer, &main, location);
+            let cursor = CursorData::compute(&elements, 1, location, Scale::from(1.));
+            let (_, damage) =
+                prepare_metadata(&mut state, &mut buffer, &elements, &cursor, true).unwrap();
+            publish_cursor(
+                &mut state,
+                &mut buffer,
+                &cursor,
+                damage,
+                [0, 0, 255, 255],
+                &mut sequence,
+            );
+            assert!(consumer.consume(&buffer));
+
+            cursor_buffer.set_color([0., 0., 1., 1.]);
+            let elements = scene(&cursor_buffer, &main, location);
+            let cursor = CursorData::compute(&elements, 1, location, Scale::from(1.));
+            let (_, damage) =
+                prepare_metadata(&mut state, &mut buffer, &elements, &cursor, true).unwrap();
+            let result: anyhow::Result<()> = state.render_frame(cursor.location, |_| unsafe {
+                write_cursor_metadata(
+                    &mut *buffer.spa,
+                    &cursor,
+                    damage.redraw_cursor,
+                    |size, dst| {
+                        if fail_bitmap {
+                            bail!("cursor bitmap rendering failed");
+                        }
+                        fill_bitmap(size, dst, [255, 0, 0, 255]);
+                        Ok(())
+                    },
+                )?;
+                bail!("main frame rendering failed");
+            });
+            assert!(result.is_err());
+            if fail_bitmap {
+                assert_eq!(
+                    buffer.cursor().bitmap_offset,
+                    0,
+                    "no transparent error placeholder"
+                );
+            }
+            buffer.discard();
+            assert!(!consumer.consume(&buffer));
+            assert_eq!(consumer.pixels, [0, 0, 255, 255].repeat(4));
+
+            let (_, damage) =
+                prepare_metadata(&mut state, &mut buffer, &elements, &cursor, true).unwrap();
+            assert!(damage.redraw_cursor);
+            publish_cursor(
+                &mut state,
+                &mut buffer,
+                &cursor,
+                damage,
+                [255, 0, 0, 255],
+                &mut sequence,
+            );
+            assert!(consumer.consume(&buffer));
+            assert_eq!(consumer.pixels, [255, 0, 0, 255].repeat(4));
+            assert_eq!(sequence, 2);
+        }
+    }
+
+    #[test]
+    fn cursor_bitmap_requires_full_metadata_storage() {
+        let mut buffer = TestBuffer::new();
+        buffer.metas[0].size = mem::size_of::<spa_meta_cursor>() as _;
+        let cursor_buffer = SolidColorBuffer::new((2., 2.), [1., 0., 0., 1.]);
+        let main = SolidColorBuffer::new((32., 32.), [0., 0., 0., 1.]);
+        let location = Point::from((8., 8.));
+        let elements = scene(&cursor_buffer, &main, location);
+        let cursor = CursorData::compute(&elements, 1, location, Scale::from(1.));
+        let result = unsafe {
+            write_cursor_metadata(&mut *buffer.spa, &cursor, true, |_, _| {
+                panic!("must reject undersized metadata before writing bitmap data");
+            })
+        };
+        assert!(result.is_err());
+        assert!(unsafe { add_invisible_cursor(&mut *buffer.spa) }.is_err());
+    }
+
+    #[test]
+    fn main_damage_retries_after_unavailable_buffer() {
+        let mut state = ready_state();
+        let mut buffer = TestBuffer::new();
+        let cursor_buffer = SolidColorBuffer::new((2., 2.), [1., 0., 0., 1.]);
+        let mut main = SolidColorBuffer::new((32., 32.), [0., 0., 0., 1.]);
+        let location = Point::from((8., 8.));
+        let elements = scene(&cursor_buffer, &main, location);
+        let cursor = CursorData::compute(&elements, 1, location, Scale::from(1.));
+        assert!(
+            prepare_metadata(&mut state, &mut buffer, &elements, &cursor, true)
+                .unwrap()
+                .1
+                .redraw_cursor
+        );
+        state.render_frame(cursor.location, |_| Ok(())).unwrap();
+        assert!(prepare_metadata(&mut state, &mut buffer, &elements, &cursor, true).is_none());
+
+        main.set_color([1., 1., 1., 1.]);
+        let elements = scene(&cursor_buffer, &main, location);
+        let cursor = CursorData::compute(&elements, 1, location, Scale::from(1.));
+        assert!(prepare_metadata(&mut state, &mut buffer, &elements, &cursor, false).is_none());
+        let (_, damage) =
+            prepare_metadata(&mut state, &mut buffer, &elements, &cursor, true).unwrap();
+        assert!(
+            damage.redraw_cursor,
+            "buffer exhaustion forces a complete retry"
+        );
+    }
 
     #[test]
     fn shm_layout_uses_spa_representable_dimensions() {
