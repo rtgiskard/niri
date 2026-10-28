@@ -20,3 +20,9 @@ This is necessary in order to throttle frame callbacks sent to applications to a
 Without this throttling, applications can start continuously redrawing without damage (for instance, if the application window is partially off-screen, and it is only the off-screen part that changes), and eating a lot of CPU in the process.
 
 Then, either the estimated VBlank timer completes, and we go back to `Idle`, or maybe we call `queue_redraw()` once more and try to redraw again.
+
+## Cursor animation geometry
+
+All frames of a `PreparedCursor` share one normalized canvas and hotspot.
+Geometry queries use its cached size and hotspot without selecting an animation frame.
+Only retrieving the image to render requires time-based frame selection.
