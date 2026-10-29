@@ -1,4 +1,5 @@
 use std::cell::{Cell, Ref, RefCell};
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use niri_config::{Color, Config, CornerRadius, GradientInterpolation, WindowRule};
@@ -62,6 +63,11 @@ pub struct Mapped {
 
     /// Up-to-date rules.
     rules: ResolvedWindowRules,
+
+    /// Tags set by actions, retained when rules are recomputed.
+    manual_tags: BTreeSet<String>,
+    /// Tags produced by the most recent ordered rule evaluation.
+    dynamic_tags: BTreeSet<String>,
 
     /// Whether the window rules need to be recomputed.
     ///
@@ -272,7 +278,14 @@ enum RequestSizeOnce {
 }
 
 impl Mapped {
-    pub fn new(window: Window, rules: ResolvedWindowRules, hook: HookId, config: &Config) -> Self {
+    pub fn new(
+        window: Window,
+        rules: ResolvedWindowRules,
+        manual_tags: BTreeSet<String>,
+        dynamic_tags: BTreeSet<String>,
+        hook: HookId,
+        config: &Config,
+    ) -> Self {
         let surface = window.wl_surface().expect("no X11 support");
         let credentials = get_credentials_for_surface(&surface);
         let mut rv = Self {
@@ -281,6 +294,8 @@ impl Mapped {
             credentials,
             pre_commit_hook: hook,
             rules,
+            manual_tags,
+            dynamic_tags,
             need_to_recompute_rules: false,
             needs_configure: false,
             needs_frame_callback: false,
@@ -324,7 +339,9 @@ impl Mapped {
     pub fn recompute_window_rules(&mut self, rules: &[WindowRule], is_at_startup: bool) -> bool {
         self.need_to_recompute_rules = false;
 
-        let new_rules = ResolvedWindowRules::compute(rules, WindowRef::Mapped(self), is_at_startup);
+        let (new_rules, dynamic_tags) =
+            ResolvedWindowRules::compute(rules, WindowRef::Mapped(self), is_at_startup);
+        self.dynamic_tags = dynamic_tags;
         if new_rules == self.rules {
             return false;
         }
@@ -381,6 +398,30 @@ impl Mapped {
 
     pub fn is_window_cast_target(&self) -> bool {
         self.is_window_cast_target
+    }
+
+    pub fn manual_tags(&self) -> &BTreeSet<String> {
+        &self.manual_tags
+    }
+
+    /// Effective tags in sorted order, with duplicate sources collapsed.
+    pub fn tags(&self) -> impl Iterator<Item = &String> {
+        self.manual_tags.union(&self.dynamic_tags)
+    }
+
+    pub fn set_tag(&mut self, tag: String) {
+        self.need_to_recompute_rules |= self.manual_tags.insert(tag);
+    }
+
+    pub fn unset_tag(&mut self, tag: &str) {
+        self.need_to_recompute_rules |= self.manual_tags.remove(tag);
+    }
+
+    pub fn toggle_tag(&mut self, tag: String) {
+        if !self.manual_tags.remove(&tag) {
+            self.manual_tags.insert(tag);
+        }
+        self.need_to_recompute_rules = true;
     }
 
     pub fn toggle_ignore_opacity_window_rule(&mut self) {

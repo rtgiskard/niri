@@ -8,7 +8,7 @@ use calloop::RegistrationToken;
 use input::event::gesture::GestureEventCoordinates as _;
 use niri_config::{
     Action, Bind, Binds, BoundAction, Config, Key, ModKey, Modifiers, MruDirection, SwitchBinds,
-    Trigger,
+    TagOperation, Trigger,
 };
 use niri_ipc::LayoutSwitchTarget;
 use smithay::backend::input::{
@@ -2518,6 +2518,33 @@ impl State {
                 if self.niri.layout.close_overview() {
                     self.niri.queue_redraw_all();
                 }
+            }
+            Action::Tag(operation, tag) => {
+                let window = self
+                    .niri
+                    .layout
+                    .active_workspace_mut()
+                    .and_then(|ws| ws.active_window_mut());
+                if let Some(window) = window {
+                    match operation {
+                        TagOperation::Set => window.set_tag(tag),
+                        TagOperation::Unset => window.unset_tag(&tag),
+                        TagOperation::Toggle => window.toggle_tag(tag),
+                    }
+                }
+            }
+            Action::TagById { id, operation, tag } => {
+                let mut tag = Some(tag);
+                self.niri.layout.with_windows_mut(|window, _| {
+                    if window.id().get() == id {
+                        let tag = tag.take().unwrap();
+                        match operation {
+                            TagOperation::Set => window.set_tag(tag),
+                            TagOperation::Unset => window.unset_tag(&tag),
+                            TagOperation::Toggle => window.toggle_tag(tag),
+                        }
+                    }
+                });
             }
             Action::ToggleWindowUrgent(id) => {
                 let window = self

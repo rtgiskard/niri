@@ -7162,11 +7162,12 @@ impl Niri {
             let window_rules = &self.config.borrow().window_rules;
 
             for unmapped in self.unmapped_windows.values_mut() {
-                let new_rules = ResolvedWindowRules::compute(
+                let (new_rules, dynamic_tags) = ResolvedWindowRules::compute(
                     window_rules,
                     WindowRef::Unmapped(unmapped),
                     self.is_at_startup,
                 );
+                unmapped.dynamic_tags = dynamic_tags;
                 if let InitialConfigureState::Configured { rules, .. } = &mut unmapped.state {
                     *rules = new_rules;
                 }

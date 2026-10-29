@@ -234,6 +234,13 @@ pub struct SwitchAction {
     pub spawn: Vec<String>,
 }
 
+#[derive(knuffel::DecodeScalar, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagOperation {
+    Set,
+    Unset,
+    Toggle,
+}
+
 // Remember to add new actions to the CLI enum too.
 #[derive(knuffel::Decode, Debug, Clone, PartialEq)]
 pub enum Action {
@@ -490,6 +497,16 @@ pub enum Action {
     ToggleWindowRuleOpacity,
     #[knuffel(skip)]
     ToggleWindowRuleOpacityById(u64),
+    Tag(
+        #[knuffel(argument)] TagOperation,
+        #[knuffel(argument)] String,
+    ),
+    #[knuffel(skip)]
+    TagById {
+        id: u64,
+        operation: TagOperation,
+        tag: String,
+    },
     SetDynamicCastWindow,
     #[knuffel(skip)]
     SetDynamicCastWindowById(u64),
@@ -827,6 +844,17 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::ToggleWindowRuleOpacity { id: None } => Self::ToggleWindowRuleOpacity,
             niri_ipc::Action::ToggleWindowRuleOpacity { id: Some(id) } => {
                 Self::ToggleWindowRuleOpacityById(id)
+            }
+            niri_ipc::Action::Tag { action } => {
+                let (operation, id, tag) = match action {
+                    niri_ipc::TagAction::Set { id, tag } => (TagOperation::Set, id, tag),
+                    niri_ipc::TagAction::Unset { id, tag } => (TagOperation::Unset, id, tag),
+                    niri_ipc::TagAction::Toggle { id, tag } => (TagOperation::Toggle, id, tag),
+                };
+                match id {
+                    Some(id) => Self::TagById { id, operation, tag },
+                    None => Self::Tag(operation, tag),
+                }
             }
             niri_ipc::Action::SetDynamicCastWindow { id: None } => Self::SetDynamicCastWindow,
             niri_ipc::Action::SetDynamicCastWindow { id: Some(id) } => {

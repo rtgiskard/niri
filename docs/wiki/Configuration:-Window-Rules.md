@@ -37,6 +37,7 @@ window-rule {
     match is-window-cast-target=true
     match is-urgent=true
     match at-startup=true
+    match tag="private"
 
     // Properties that apply once upon window opening.
     default-column-width { proportion 0.75; }
@@ -50,6 +51,7 @@ window-rule {
     open-focused false
 
     // Properties that apply continuously.
+    tag "terminal"
     draw-border-with-background false
     opacity 0.5
     block-out-from "screencast"
@@ -338,6 +340,62 @@ window-rule {
     open-on-output "HDMI-A-1"
 }
 ```
+
+#### `tag`
+
+Matches an exact, case-sensitive window tag, whether set manually or produced by an earlier window rule.
+Use `exclude tag="name"` to exclude tagged windows.
+See [Window Tags](#window-tags) for assigning tags and their evaluation order.
+
+### Window Tags
+
+Tags let bindings and scripts switch a window's properties through the existing window rules.
+A window can have multiple tags. Tags have two independent sources:
+
+- **Manual tags**, changed by the [`tag`](./Configuration:-Key-Bindings.md#tag) action with `"set"`, `"unset"`, or `"toggle"`.
+- **Dynamic tags**, added by matching window rules with `tag "name"`. Repeated additions are idempotent; a rule can contain multiple `tag` directives.
+
+```kdl
+window-rule {
+    match app-id=r#"^(Alacritty|kitty|foot)$"#
+    tag "terminal"
+}
+
+window-rule {
+    match tag="terminal"
+    tag "dimmed"
+}
+
+window-rule {
+    match tag="dimmed"
+    opacity 0.85
+}
+
+window-rule {
+    match tag="private"
+    block-out-from "screencast"
+}
+
+binds {
+    Mod+F12 { tag "toggle" "private"; }
+}
+```
+
+Rules are evaluated once in configuration order, starting with the manual tags and no dynamic tags.
+A rule's match and exclude directives see manual tags and the dynamic tags produced by earlier rules.
+Tags added by a rule are available to subsequent rules immediately; earlier rules are not revisited.
+This permits tag-to-tag derivation without recursive evaluation.
+
+Dynamic tags are rebuilt whenever rules are recomputed, including on title changes and configuration reloads.
+They do not retain results from a previous evaluation.
+Manual tags survive configuration reloads and unmapping/remapping the same toplevel, but are discarded when that toplevel is destroyed.
+Unsetting a manual tag does not remove the same tag produced by a rule.
+To opt out of a dynamic tag, use another manual tag with an `exclude` directive on the producing rule.
+
+Changing tags recomputes properties from the current configuration; it does not restore a saved property snapshot.
+Window-opening properties still apply only during initial configure, not when tags change on an already open window.
+The `windows`, `focused-window`, and `pick-window` IPC responses contain the sorted, deduplicated effective `tags` array.
+Tag-only changes also produce a `WindowOpenedOrChanged` event.
 
 ### Window Opening Properties
 

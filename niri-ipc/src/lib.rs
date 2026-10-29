@@ -948,6 +948,12 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(long))]
         id: u64,
     },
+    /// Change a manual tag on a window.
+    Tag {
+        /// Operation, tag name, and optional target window.
+        #[cfg_attr(feature = "clap", command(subcommand))]
+        action: TagAction,
+    },
     /// Reload the config file.
     ///
     /// Can be useful for scripts changing the config file, to avoid waiting the small duration for
@@ -958,6 +964,37 @@ pub enum Action {
         /// If unset, reloads the current config file.
         #[cfg_attr(feature = "clap", arg(long))]
         path: Option<String>,
+    },
+}
+
+/// Actions that change a window's manual tags.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "clap", derive(clap::Subcommand))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum TagAction {
+    /// Add a manual tag to a window.
+    Set {
+        /// Id of the window; if unset, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+        /// Tag to add (matched exactly).
+        tag: String,
+    },
+    /// Remove a manual tag from a window.
+    Unset {
+        /// Id of the window; if unset, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+        /// Tag to remove (matched exactly).
+        tag: String,
+    },
+    /// Toggle a manual tag on a window.
+    Toggle {
+        /// Id of the window; if unset, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+        /// Tag to toggle (matched exactly).
+        tag: String,
     },
 }
 
@@ -1358,6 +1395,9 @@ pub struct Window {
     pub title: Option<String>,
     /// Application ID, if set.
     pub app_id: Option<String>,
+    /// Sorted, deduplicated manual and rule-assigned tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
     /// Process ID that created the Wayland connection for this window, if known.
     ///
     /// Currently, windows created by xdg-desktop-portal-gnome will have a `None` PID, but this may

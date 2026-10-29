@@ -2298,6 +2298,7 @@ mod tests {
                                 ),
                             ),
                             title: None,
+                            tag: None,
                             is_active: None,
                             is_focused: None,
                             is_active_in_column: None,
@@ -2317,6 +2318,7 @@ mod tests {
                                     ),
                                 ),
                             ),
+                            tag: None,
                             is_active: None,
                             is_focused: None,
                             is_active_in_column: None,
@@ -2328,6 +2330,7 @@ mod tests {
                         Match {
                             app_id: None,
                             title: None,
+                            tag: None,
                             is_active: Some(
                                 true,
                             ),
@@ -2371,6 +2374,7 @@ mod tests {
                     on_xdg_activate: Some(
                         Ignore,
                     ),
+                    tags: [],
                     min_width: None,
                     min_height: None,
                     max_width: None,

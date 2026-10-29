@@ -497,6 +497,27 @@ binds {
 }
 ```
 
+#### `tag`
+
+Add, remove, or toggle a manual [window tag](./Configuration:-Window-Rules.md#window-tags) on the current window with `tag "set" "name"`, `tag "unset" "name"`, or `tag "toggle" "name"`.
+This action changes only manual tags: a tag produced by a window rule remains present even after its manual source is removed.
+Toggling checks the manual source, not the combined effective tags.
+
+```kdl
+binds {
+    Mod+F12 { tag "toggle" "private"; }
+}
+```
+
+From scripts, use the optional `--id` to target a specific window; otherwise the current window is used:
+Explicit `--id` targeting also works while that window is being interactively moved.
+
+```shell
+niri msg action tag set private --id 42
+niri msg action tag unset private --id 42
+niri msg action tag toggle private
+```
+
 #### `screenshot`, `screenshot-screen`, `screenshot-window`
 
 Actions for taking screenshots.

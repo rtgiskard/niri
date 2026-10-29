@@ -1085,11 +1085,12 @@ impl State {
         };
 
         let config = self.niri.config.borrow();
-        let rules = ResolvedWindowRules::compute(
+        let (rules, dynamic_tags) = ResolvedWindowRules::compute(
             &config.window_rules,
             WindowRef::Unmapped(unmapped),
             self.niri.is_at_startup,
         );
+        unmapped.dynamic_tags = dynamic_tags;
 
         let Unmapped { window, state, .. } = unmapped;
 
@@ -1435,11 +1436,12 @@ impl State {
         let window_rules = &config.window_rules;
 
         if let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) {
-            let new_rules = ResolvedWindowRules::compute(
+            let (new_rules, dynamic_tags) = ResolvedWindowRules::compute(
                 window_rules,
                 WindowRef::Unmapped(unmapped),
                 self.niri.is_at_startup,
             );
+            unmapped.dynamic_tags = dynamic_tags;
             if let InitialConfigureState::Configured { rules, .. } = &mut unmapped.state {
                 *rules = new_rules;
             }
