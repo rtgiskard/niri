@@ -37,6 +37,7 @@ window-rule {
     match is-window-cast-target=true
     match is-urgent=true
     match at-startup=true
+    match tag="private"
 
     // Properties that apply once upon window opening.
     default-column-width { proportion 0.75; }
@@ -50,6 +51,7 @@ window-rule {
     open-focused false
 
     // Properties that apply continuously.
+    tag "terminal"
     draw-border-with-background false
     opacity 0.5
     block-out-from "screencast"
@@ -275,6 +277,7 @@ window-rule {
 
 Can be `true` or `false`.
 Matches `true` for windows that are target of an ongoing window screencast.
+This includes PipeWire window screencasts and window-content sessions using `ext-image-copy-capture`, but not cursor-only capture sessions.
 
 > [!NOTE]
 > This only matches individual-window screencasts.
@@ -338,6 +341,65 @@ window-rule {
     open-on-output "HDMI-A-1"
 }
 ```
+
+#### `tag`
+
+Matches an exact, case-sensitive window tag, whether set manually or produced by an earlier window rule.
+Use `exclude tag="name"` to exclude tagged windows.
+See [Window Tags](#window-tags) for assigning tags and their evaluation order.
+
+### Window Tags
+
+Tags let bindings and scripts switch a window's properties through the existing window rules.
+A window can have multiple tags. Tags have two independent sources:
+
+- **Manual tags**, changed by the [`tag`](./Configuration:-Key-Bindings.md#tag) action with `"set"`, `"unset"`, or `"toggle"`.
+- **Dynamic tags**, added by matching window rules with `tag "name"`. Repeated additions are idempotent; a rule can contain multiple `tag` directives.
+
+```kdl
+window-rule {
+    match app-id=r#"^(Alacritty|kitty|foot)$"#
+    tag "terminal"
+}
+
+window-rule {
+    match tag="terminal"
+    tag "dimmed"
+}
+
+window-rule {
+    match tag="dimmed"
+    opacity 0.85
+}
+
+window-rule {
+    match tag="private"
+    block-out-from "screencast"
+}
+
+binds {
+    Mod+F12 { tag "toggle" "private"; }
+}
+```
+
+This example blocks the tagged window from xdg-desktop-portal screencasts.
+Use `block-out-from "screen-capture"` to also block third-party capture tools, including `ext-image-copy-capture` window capture; see [`block-out-from`](#block-out-from).
+
+Rules are evaluated once in configuration order, starting with the manual tags and no dynamic tags.
+A rule's match and exclude directives see manual tags and the dynamic tags produced by earlier rules.
+Tags added by a rule are available to subsequent rules immediately; earlier rules are not revisited.
+This permits tag-to-tag derivation without recursive evaluation.
+
+Dynamic tags are rebuilt whenever rules are recomputed, including on title changes and configuration reloads.
+They do not retain results from a previous evaluation.
+Manual tags survive configuration reloads and unmapping/remapping the same toplevel, but are discarded when that toplevel is destroyed.
+Unsetting a manual tag does not remove the same tag produced by a rule.
+To opt out of a dynamic tag, use another manual tag with an `exclude` directive on the producing rule.
+
+Changing tags recomputes properties from the current configuration; it does not restore a saved property snapshot.
+Window-opening properties still apply only during initial configure, not when tags change on an already open window.
+The `windows`, `focused-window`, and `pick-window` IPC responses contain the sorted, deduplicated effective `tags` array.
+Tag-only changes also produce a `WindowOpenedOrChanged` event.
 
 ### Window Opening Properties
 
@@ -551,6 +613,7 @@ To preview and set up this rule, check the `preview-render` option in the debug 
 > [!CAUTION]
 > The window is **not** blocked out from third-party screenshot tools.
 > If you open some screenshot tool with preview while screencasting, blocked out windows **will be visible** on the screencast.
+> This also applies to tools using `ext-image-copy-capture`, including individual-window capture: they use the screen-capture render target even when recording video.
 
 The built-in screenshot UI is not affected by this problem though.
 If you open the screenshot UI while screencasting, you will be able to select the area to screenshot while seeing all windows normally, but on a screencast the selection UI will display with windows blocked out.
@@ -567,6 +630,7 @@ window-rule {
 
 Alternatively, you can block out the window out of *all* screen captures, including third-party screenshot tools.
 This way you avoid accidentally showing the window on a screencast when opening a third-party screenshot preview.
+This includes output and individual-window captures through `ext-image-copy-capture`.
 
 This setting will still let you use the interactive built-in screenshot UI, but it will block out the window from the fully automatic screenshot actions, such as `screenshot-screen` and `screenshot-window`.
 The reasoning is that with an interactive selection, you can make sure that you avoid screenshotting sensitive content.

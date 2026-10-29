@@ -84,6 +84,8 @@ impl CompositorHandler for State {
                         window,
                         state,
                         activation_token_data,
+                        manual_tags,
+                        dynamic_tags,
                     } = entry.remove();
 
                     window.on_commit();
@@ -196,7 +198,7 @@ impl CompositorHandler for State {
                     let hook = add_mapped_toplevel_pre_commit_hook(toplevel);
                     let mapped = {
                         let config = self.niri.config.borrow();
-                        Mapped::new(window, rules, hook, &config)
+                        Mapped::new(window, rules, manual_tags, dynamic_tags, hook, &config)
                     };
                     let window = mapped.window.clone();
 
@@ -267,6 +269,7 @@ impl CompositorHandler for State {
 
                 // This is a commit of a previously-mapped toplevel.
                 let is_mapped = is_mapped(surface);
+                let manual_tags = (!is_mapped).then(|| mapped.manual_tags().clone());
 
                 // Must start the close animation before window.on_commit().
                 let transaction = Transaction::new();
@@ -309,7 +312,8 @@ impl CompositorHandler for State {
 
                     // Newly-unmapped toplevels must perform the initial commit-configure sequence
                     // afresh.
-                    let unmapped = Unmapped::new(window);
+                    let mut unmapped = Unmapped::new(window);
+                    unmapped.manual_tags = manual_tags.unwrap();
                     self.niri.unmapped_windows.insert(surface.clone(), unmapped);
 
                     if let Some(output) = output {

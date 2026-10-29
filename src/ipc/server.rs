@@ -522,6 +522,7 @@ fn make_ipc_window(
         id: mapped.id().get(),
         title: role.title.clone(),
         app_id: role.app_id.clone(),
+        tags: mapped.tags().cloned().collect(),
         pid: mapped.credentials().map(|c| c.pid),
         workspace_id: workspace_id.map(|id| id.get()),
         is_focused: mapped.is_focused(),
@@ -721,6 +722,7 @@ impl State {
             let workspace_id = ws_id.map(|id| id.get());
             let mut changed =
                 ipc_win.workspace_id != workspace_id || ipc_win.is_floating != mapped.is_floating();
+            changed |= !mapped.tags().eq(ipc_win.tags.iter());
 
             changed |= with_toplevel_role(mapped.toplevel(), |role| {
                 ipc_win.title != role.title || ipc_win.app_id != role.app_id

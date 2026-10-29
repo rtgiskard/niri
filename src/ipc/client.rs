@@ -723,6 +723,8 @@ fn print_window(window: &Window) {
         println!("  App ID: (unset)");
     }
 
+    println!("  Tags: {:?}", window.tags);
+
     println!(
         "  Is floating: {}",
         if window.is_floating { "yes" } else { "no" }

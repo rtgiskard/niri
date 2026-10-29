@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use niri_config::PresetSize;
 use smithay::desktop::Window;
 use smithay::output::Output;
@@ -12,6 +14,10 @@ pub struct Unmapped {
     pub state: InitialConfigureState,
     /// Activation token, if one was used on this unmapped window.
     pub activation_token_data: Option<XdgActivationTokenData>,
+    /// Tags set by actions, preserved across unmap/remap of this toplevel.
+    pub manual_tags: BTreeSet<String>,
+    /// Tags produced by the latest rule evaluation for the initial configure.
+    pub dynamic_tags: BTreeSet<String>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -87,6 +93,8 @@ impl Unmapped {
                 wants_maximized: false,
             },
             activation_token_data: None,
+            manual_tags: BTreeSet::new(),
+            dynamic_tags: BTreeSet::new(),
         }
     }
 

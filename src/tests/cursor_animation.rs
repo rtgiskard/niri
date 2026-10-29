@@ -19,7 +19,7 @@ use smithay::reexports::wayland_protocols::ext::image_capture_source::v1::client
 use smithay::reexports::wayland_protocols::ext::image_copy_capture::v1::client::{
     ext_image_copy_capture_cursor_session_v1::ExtImageCopyCaptureCursorSessionV1,
     ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1,
-    ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1,
+    ext_image_copy_capture_manager_v1::{ExtImageCopyCaptureManagerV1, Options},
     ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1,
 };
 use smithay::utils::Point;
@@ -271,6 +271,80 @@ fn window_capture_source(f: &mut Fixture, id: ClientId) -> ExtImageCaptureSource
     let source = manager.create_source(&toplevels.lock().unwrap()[0], &client.qh, ());
     list.stop();
     source
+}
+
+#[test]
+fn window_capture_tags_follow_content_sessions_not_cursor_sessions() {
+    let mut f = Fixture::with_config(
+        Config::parse_mem(
+            r#"
+        window-rule {
+            match is-window-cast-target=true
+            tag "captured"
+        }
+    "#,
+        )
+        .unwrap(),
+    );
+    f.add_output(1, (100, 100));
+    f.niri_state().backend.headless().add_renderer().unwrap();
+    let id = f.add_client();
+    f.double_roundtrip(id);
+    let source = window_capture_source(&mut f, id);
+    let (manager, cursor_session) = {
+        let client = f.client(id);
+        let registry = client.display.get_registry(&client.qh, ());
+        let global = client
+            .state
+            .globals
+            .iter()
+            .find(|g| g.interface == "ext_image_copy_capture_manager_v1")
+            .unwrap()
+            .name;
+        let manager: ExtImageCopyCaptureManagerV1 = registry.bind(global, 1, &client.qh, ());
+        let pointer = client
+            .state
+            .seats
+            .keys()
+            .next()
+            .unwrap()
+            .get_pointer(&client.qh, ());
+        let cursor_session =
+            manager.create_pointer_cursor_session(&source, &pointer, &client.qh, ());
+        (manager, cursor_session)
+    };
+    let tags = |f: &mut Fixture| {
+        f.niri()
+            .layout
+            .windows()
+            .next()
+            .unwrap()
+            .1
+            .tags()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    f.double_roundtrip(id);
+    assert!(
+        tags(&mut f).is_empty(),
+        "cursor-only capture is not a window content cast"
+    );
+
+    let session = {
+        let client = f.client(id);
+        manager.create_session(&source, Options::empty(), &client.qh, ())
+    };
+    f.double_roundtrip(id);
+    assert_eq!(tags(&mut f), ["captured"]);
+
+    session.destroy();
+    f.double_roundtrip(id);
+    assert!(
+        tags(&mut f).is_empty(),
+        "content capture ending must clear derived tags even while cursor capture remains"
+    );
+    cursor_session.destroy();
+    f.roundtrip(id);
 }
 
 fn pending_cursor_capture(window_source: bool) {

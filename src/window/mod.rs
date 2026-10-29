@@ -1,4 +1,5 @@
 use std::cmp::{max, min};
+use std::collections::BTreeSet;
 
 use niri_config::utils::MergeWith as _;
 use niri_config::window_rule::{Match, OnXdgActivate, VrrRule, WindowRule};
@@ -183,13 +184,26 @@ impl<'a> WindowRef<'a> {
             WindowRef::Mapped(mapped) => mapped.is_window_cast_target(),
         }
     }
+
+    pub fn manual_tags(self) -> &'a BTreeSet<String> {
+        match self {
+            WindowRef::Unmapped(unmapped) => &unmapped.manual_tags,
+            WindowRef::Mapped(mapped) => mapped.manual_tags(),
+        }
+    }
 }
 
 impl ResolvedWindowRules {
-    pub fn compute(rules: &[WindowRule], window: WindowRef, is_at_startup: bool) -> Self {
+    pub fn compute(
+        rules: &[WindowRule],
+        window: WindowRef,
+        is_at_startup: bool,
+    ) -> (Self, BTreeSet<String>) {
         let _span = tracy_client::span!("ResolvedWindowRules::compute");
 
         let mut resolved = ResolvedWindowRules::default();
+        let mut dynamic_tags = BTreeSet::new();
+        let manual_tags = window.manual_tags();
 
         with_toplevel_role(window.toplevel(), |role| {
             // Ensure server_pending like in Smithay's with_pending_state().
@@ -208,6 +222,11 @@ impl ResolvedWindowRules {
                         }
                     }
 
+                    if let Some(tag) = &m.tag {
+                        if !manual_tags.contains(tag) && !dynamic_tags.contains(tag) {
+                            return false;
+                        }
+                    }
                     window_matches(window, role, m)
                 };
 
@@ -217,6 +236,11 @@ impl ResolvedWindowRules {
 
                 if rule.excludes.iter().any(matches) {
                     continue;
+                }
+                for tag in &rule.tags {
+                    if !dynamic_tags.contains(tag) {
+                        dynamic_tags.insert(tag.clone());
+                    }
                 }
 
                 if let Some(x) = rule.default_column_width {
@@ -327,7 +351,7 @@ impl ResolvedWindowRules {
             resolved.open_on_workspace = open_on_workspace.map(|x| x.to_owned());
         });
 
-        resolved
+        (resolved, dynamic_tags)
     }
 
     pub fn apply_min_size(&self, min_size: Size<i32, Logical>) -> Size<i32, Logical> {

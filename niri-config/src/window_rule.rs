@@ -39,6 +39,8 @@ pub struct WindowRule {
     pub on_xdg_activate: Option<OnXdgActivate>,
 
     // Rules applied dynamically.
+    #[knuffel(children(name = "tag"), unwrap(argument))]
+    pub tags: Vec<String>,
     #[knuffel(child, unwrap(argument))]
     pub min_width: Option<u16>,
     #[knuffel(child, unwrap(argument))]
@@ -138,6 +140,8 @@ pub struct Match {
     pub app_id: Option<RegexEq>,
     #[knuffel(property, str)]
     pub title: Option<RegexEq>,
+    #[knuffel(property)]
+    pub tag: Option<String>,
     #[knuffel(property)]
     pub is_active: Option<bool>,
     #[knuffel(property)]
