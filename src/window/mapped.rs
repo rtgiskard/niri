@@ -546,7 +546,7 @@ impl Mapped {
         scale: Scale<f64>,
         push: &mut dyn FnMut(WindowCastRenderElements<R>),
     ) {
-        let bbox = self.window.bbox_with_popups().to_physical_precise_up(scale);
+        let bbox = self.capture_bbox(scale);
 
         let has_border_shader = BorderRenderElement::has_shader(ctx.renderer);
         let radius = self.geometry_corner_radius();
@@ -556,7 +556,7 @@ impl Mapped {
             .to_physical_precise_round(scale)
             .to_logical(scale);
         let radius = radius.fit_to(window_size.w as f32, window_size.h as f32);
-        let location = self.window.geometry().loc.to_f64() - bbox.loc.to_logical(scale);
+        let location = self.window.geometry().loc.to_f64() - bbox.loc.to_f64().to_logical(scale);
 
         let use_border = |elem| {
             if let LayoutElementRenderElement::SolidColor(elem) = &elem {

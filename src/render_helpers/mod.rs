@@ -377,25 +377,8 @@ pub fn render_to_shm(
             "buffer does not fit in its shm pool"
         );
 
-        let mut texture =
-            create_texture(renderer, size, fourcc).context("error creating texture")?;
-        let mut target = renderer
-            .bind(&mut texture)
-            .context("error binding texture")?;
-
-        let _res = damage_tracker
-            .render_output_with_states(
-                renderer,
-                &mut target,
-                0,
-                elements,
-                Color32F::TRANSPARENT,
-                states,
-            )
-            .context("error rendering")?;
-
         let mapping =
-            copy_framebuffer(renderer, &target, fourcc).context("error copying framebuffer")?;
+            render_and_download_with_damage(renderer, damage_tracker, fourcc, elements, states)?;
         let bytes = renderer
             .map_texture(&mapping)
             .context("error mapping texture")?;
