@@ -256,6 +256,9 @@ pub fn capture_buffer(buffer: &WlBuffer, size: Size<i32, BufferCoords>) -> Optio
 /// Finishes a frame, waiting for `sync_point` first if the render is still in flight.
 ///
 /// Like `Screencopy::submit_after_sync()`.
+/// Returns whether delivery completed or its fence wait was registered. On failure,
+/// the caller must invalidate damage history so a retry redraws the whole source.
+#[must_use]
 pub fn frame_success_after_sync<T>(
     frame: Frame,
     transform: Transform,
@@ -263,10 +266,10 @@ pub fn frame_success_after_sync<T>(
     presented: Duration,
     sync_point: SyncPoint,
     event_loop: &LoopHandle<'static, T>,
-) {
+) -> bool {
     let Some(sync_fd) = sync_point.export() else {
         frame.success(transform, damage, presented);
-        return;
+        return true;
     };
 
     let mut pending = Some((frame, damage));
@@ -280,7 +283,9 @@ pub fn frame_success_after_sync<T>(
         // The client will retry (smithay sends an Unknown error when Drop is
         // called on the Frame).
         warn!("error waiting for image copy capture sync point: {err}");
+        return false;
     }
+    true
 }
 
 impl ImageCaptureSourceHandler for State {}

@@ -21,6 +21,13 @@ Without this throttling, applications can start continuously redrawing without d
 
 Then, either the estimated VBlank timer completes, and we go back to `Idle`, or maybe we call `queue_redraw()` once more and try to redraw again.
 
+## Image-copy capture delivery
+
+Image-copy sessions maintain damage history independently of the displayed output.
+Damage analysis advances that history before rendering and frame delivery have succeeded.
+If rendering or registration of the render-fence wait fails, reset the session's damage tracker so a client retry redraws the entire source, even when the scene has not changed.
+Successful fence registration transfers frame completion to the event source; the client receives `ready` only after the fence signals.
+
 ## Cursor animation geometry
 
 All frames of a `PreparedCursor` share one normalized canvas and hotspot.

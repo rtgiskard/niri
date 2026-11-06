@@ -18,7 +18,7 @@ use smithay::reexports::wayland_protocols::ext::image_capture_source::v1::client
 };
 use smithay::reexports::wayland_protocols::ext::image_copy_capture::v1::client::{
     ext_image_copy_capture_cursor_session_v1::ExtImageCopyCaptureCursorSessionV1,
-    ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1,
+    ext_image_copy_capture_frame_v1::{self, ExtImageCopyCaptureFrameV1},
     ext_image_copy_capture_manager_v1::{ExtImageCopyCaptureManagerV1, Options},
     ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1,
 };
@@ -67,6 +67,29 @@ impl Dispatch<ExtForeignToplevelListV1, Toplevels> for ClientState {
     wayland_client::event_created_child!(ClientState, ExtForeignToplevelListV1, [
         0 => (ExtForeignToplevelHandleV1, ())
     ]);
+}
+
+type FrameResults = Arc<Mutex<Vec<bool>>>;
+
+impl Dispatch<ExtImageCopyCaptureFrameV1, FrameResults> for ClientState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ExtImageCopyCaptureFrameV1,
+        event: ext_image_copy_capture_frame_v1::Event,
+        results: &FrameResults,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_image_copy_capture_frame_v1::Event::Ready { .. } => {
+                results.lock().unwrap().push(true)
+            }
+            ext_image_copy_capture_frame_v1::Event::Failed { .. } => {
+                results.lock().unwrap().push(false)
+            }
+            _ => (),
+        }
+    }
 }
 
 struct AnimatedTheme(PathBuf);
@@ -343,6 +366,131 @@ fn window_capture_tags_follow_content_sessions_not_cursor_sessions() {
         tags(&mut f).is_empty(),
         "content capture ending must clear derived tags even while cursor capture remains"
     );
+    cursor_session.destroy();
+    f.roundtrip(id);
+}
+
+#[test]
+fn image_copy_fence_registration_failure_rejects_frame_and_allows_retry() {
+    use smithay::backend::renderer::sync::{Fence, Interrupted, SyncPoint};
+    use smithay::utils::{Rectangle, Transform};
+
+    #[derive(Debug)]
+    struct UnpollableFence;
+
+    impl Fence for UnpollableFence {
+        fn is_signaled(&self) -> bool {
+            false
+        }
+        fn wait(&self) -> Result<(), Interrupted> {
+            Err(Interrupted)
+        }
+        fn is_exportable(&self) -> bool {
+            true
+        }
+        fn export(&self) -> Option<std::os::fd::OwnedFd> {
+            // epoll rejects this fd, deterministically exercising insert_source failure.
+            Some(std::fs::File::open("/dev/null").unwrap().into())
+        }
+    }
+
+    let mut f = Fixture::with_config(Config::default());
+    f.add_output(1, (100, 100));
+    let id = f.add_client();
+    f.double_roundtrip(id);
+    let (cursor_session, session, shm) = {
+        let client = f.client(id);
+        let registry = client.display.get_registry(&client.qh, ());
+        let global = |interface| {
+            client
+                .state
+                .globals
+                .iter()
+                .find(|g| g.interface == interface)
+                .unwrap()
+                .name
+        };
+        let manager: ExtImageCopyCaptureManagerV1 = registry.bind(
+            global("ext_image_copy_capture_manager_v1"),
+            1,
+            &client.qh,
+            (),
+        );
+        let shm: WlShm = registry.bind(global("wl_shm"), 1, &client.qh, ());
+        let source_manager: ExtOutputImageCaptureSourceManagerV1 = registry.bind(
+            global("ext_output_image_capture_source_manager_v1"),
+            1,
+            &client.qh,
+            (),
+        );
+        let output = client.state.outputs.keys().next().unwrap();
+        let source = source_manager.create_source(output, &client.qh, ());
+        let pointer = client
+            .state
+            .seats
+            .keys()
+            .next()
+            .unwrap()
+            .get_pointer(&client.qh, ());
+        let cursor_session =
+            manager.create_pointer_cursor_session(&source, &pointer, &client.qh, ());
+        let session = cursor_session.get_capture_session(&client.qh, ());
+        (cursor_session, session, shm)
+    };
+    f.double_roundtrip(id);
+    let output = f.niri_output(1);
+    let size =
+        crate::handlers::image_copy_capture::cursor_capture_constraints(f.niri(), &output).size;
+    let len = size.w * size.h * 4;
+    let fd = memfd_create("niri-test-fence-capture", MemfdFlags::CLOEXEC).unwrap();
+    ftruncate(&fd, len as u64).unwrap();
+    let buffer = {
+        let client = f.client(id);
+        let pool = shm.create_pool(fd.as_fd(), len, &client.qh, ());
+        pool.create_buffer(
+            0,
+            size.w,
+            size.h,
+            size.w * 4,
+            wl_shm::Format::Argb8888,
+            &client.qh,
+            (),
+        )
+    };
+    for (sync, expected) in [
+        (SyncPoint::from(UnpollableFence), false),
+        (SyncPoint::signaled(), true),
+    ] {
+        let results = FrameResults::default();
+        let frame = {
+            let client = f.client(id);
+            let frame = session.create_frame(&client.qh, results.clone());
+            frame.attach_buffer(&buffer);
+            frame.damage_buffer(0, 0, size.w, size.h);
+            frame.capture();
+            frame
+        };
+        f.roundtrip(id);
+        let niri = f.niri();
+        let pending = niri.image_copy_cursor_sessions[0]
+            .pending_frame
+            .take()
+            .unwrap();
+        let accepted = crate::handlers::image_copy_capture::frame_success_after_sync(
+            pending,
+            Transform::Normal,
+            vec![Rectangle::from_size(size)],
+            Duration::ZERO,
+            sync,
+            &niri.event_loop,
+        );
+        assert_eq!(accepted, expected);
+        f.double_roundtrip(id);
+        assert_eq!(*results.lock().unwrap(), [expected]);
+        frame.destroy();
+        f.roundtrip(id);
+    }
+    session.destroy();
     cursor_session.destroy();
     f.roundtrip(id);
 }

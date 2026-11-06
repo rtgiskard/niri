@@ -5819,9 +5819,9 @@ impl Niri {
         res
     }
 
-    /// Renders the elements into the frame's buffer and completes the frame.
+    /// Renders the elements into the frame's buffer and submits it for completion.
     ///
-    /// Returns `true` if it succeeded and `false` otherwise.
+    /// Returns whether delivery completed or its fence wait was registered.
     #[allow(clippy::too_many_arguments)]
     fn capture_image_copy_frame(
         &self,
@@ -5844,17 +5844,14 @@ impl Niri {
 
         let res = capture_buffer.render(renderer, &mut s.damage_tracker, elements, states);
         match res {
-            Ok(sync) => {
-                image_copy_capture_impl::frame_success_after_sync(
-                    frame,
-                    transform,
-                    damage,
-                    target_presentation_time,
-                    sync,
-                    &self.event_loop,
-                );
-                true
-            }
+            Ok(sync) => image_copy_capture_impl::frame_success_after_sync(
+                frame,
+                transform,
+                damage,
+                target_presentation_time,
+                sync,
+                &self.event_loop,
+            ),
             Err(err) => {
                 warn!("error rendering for image copy capture: {err:?}");
                 frame.fail(CaptureFailureReason::Unknown);
