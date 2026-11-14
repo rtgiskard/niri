@@ -22,7 +22,13 @@ use xcursor::parser::{parse_xcursor, Image};
 mod resolver;
 use resolver::ThemeResolver;
 
-static FALLBACK_CURSOR_DATA: &[u8] = include_bytes!("../resources/cursor.rgba");
+static FALLBACK_CURSOR: std::sync::LazyLock<usvg::Tree> = std::sync::LazyLock::new(|| {
+    usvg::Tree::from_data(
+        include_bytes!("../resources/cursor.svg"),
+        &usvg::Options::default(),
+    )
+    .expect("invalid built-in cursor SVG")
+});
 
 // Limits apply before decoding/allocation, including to the union animation canvas.
 const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
@@ -1308,23 +1314,18 @@ fn canvas(frames: &[FrameGeometry]) -> anyhow::Result<(Size<i32, Physical>, Poin
 }
 
 fn builtin_cursor(factor: f64) -> PreparedCursor {
-    // A temporary no-I/O fallback must stay cheap even for huge configured cursor sizes.
+    // Keep the no-I/O fallback bounded even for huge configured cursor sizes.
     let factor = factor.min(2.0);
-    let side = (64.0 * factor).round().clamp(1.0, 128.0) as usize;
+    let side = (40.0 * factor).round().clamp(1.0, 80.0) as u32;
     let mut memory = MemoryBuffer::new(Fourcc::Argb8888, (side as i32, side as i32));
-    for y in 0..side {
-        for x in 0..side {
-            let source = ((y * 64 / side) * 64 + x * 64 / side) * 4;
-            let target = (y * side + x) * 4;
-            let pixel = &FALLBACK_CURSOR_DATA[source..source + 4];
-            // Premultiply the straight RGBA resource directly into the BGRA output.
-            for (channel, source_channel) in [2, 1, 0].into_iter().enumerate() {
-                memory[target + channel] =
-                    ((u16::from(pixel[source_channel]) * u16::from(pixel[3]) + 127) / 255) as u8;
-            }
-            memory[target + 3] = pixel[3];
-        }
-    }
+    let mut destination = tiny_skia::PixmapMut::from_bytes(&mut memory, side, side).unwrap();
+    let scale = side as f32 / 16.0;
+    resvg::render(
+        &FALLBACK_CURSOR,
+        tiny_skia::Transform::from_scale(scale, scale),
+        &mut destination,
+    );
+    // The black-and-white SVG produces identical R/B channels, so RGBA is also BGRA.
     PreparedCursor {
         frames: vec![CursorFrame {
             delay: 0,
@@ -1332,11 +1333,7 @@ fn builtin_cursor(factor: f64) -> PreparedCursor {
         }],
         duration: 0,
         size: (side as i32, side as i32).into(),
-        hotspot: (
-            (factor.round() as i32).clamp(0, side as i32),
-            (factor.round() as i32).clamp(0, side as i32),
-        )
-            .into(),
+        hotspot: ((4.0 * scale).round() as i32, (2.0 * scale).round() as i32).into(),
     }
 }
 

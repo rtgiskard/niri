@@ -177,7 +177,7 @@ The configured size is the theme's nominal size, which can differ from the image
 SVG artwork must be self-contained: image loading and font-based text are not supported.
 
 `xcursor-fallback` defaults to `false`: niri only looks for SVG artwork, including aliases and inherited themes.
-If a shape is missing or invalid, niri uses the theme's SVG default cursor, then its built-in pointer.
+If a shape is missing or invalid, niri uses the theme's SVG default cursor, then its built-in `nf-cod-cursor` vector pointer, which requires no installed font or theme.
 Set `xcursor-fallback true` to allow XCursor bitmap images as candidates, including for the default cursor.
 With this enabled, theme inheritance takes precedence; within the same inheritance level, SVG takes precedence over XCursor.
 Theme lookup follows `XCURSOR_PATH` when set, otherwise the user and system icon directories, including `$XDG_DATA_HOME/icons`.
