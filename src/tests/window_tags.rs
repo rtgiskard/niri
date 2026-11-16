@@ -1,4 +1,5 @@
 use niri_config::{Action, Config, TagOperation};
+use smithay::backend::input::InputTime;
 use smithay::wayland::seat::WaylandFocus as _;
 use wayland_client::protocol::wl_surface::WlSurface;
 
@@ -79,6 +80,7 @@ fn manual_sources_survive_rule_changes_and_unset_does_not_remove_dynamic_source(
             tag: "private".into(),
         },
         false,
+        InputTime::now(),
     );
     f.double_roundtrip(id);
     f.client(id).window(&surface).set_title("ordinary");
@@ -88,8 +90,11 @@ fn manual_sources_survive_rule_changes_and_unset_does_not_remove_dynamic_source(
 
     f.client(id).window(&surface).set_title("private");
     f.double_roundtrip(id);
-    f.niri_state()
-        .do_action(Action::Tag(TagOperation::Unset, "private".into()), false);
+    f.niri_state().do_action(
+        Action::Tag(TagOperation::Unset, "private".into()),
+        false,
+        InputTime::now(),
+    );
     f.double_roundtrip(id);
     assert_eq!(tags(&mut f), ["private"]);
     f.client(id).window(&surface).set_title("ordinary");
@@ -97,8 +102,11 @@ fn manual_sources_survive_rule_changes_and_unset_does_not_remove_dynamic_source(
     assert_eq!(tags(&mut f), Vec::<String>::new());
     assert_eq!(mapped(&mut f).rules().opacity, None);
 
-    f.niri_state()
-        .do_action(Action::Tag(TagOperation::Toggle, "private".into()), false);
+    f.niri_state().do_action(
+        Action::Tag(TagOperation::Toggle, "private".into()),
+        false,
+        InputTime::now(),
+    );
     f.double_roundtrip(id);
     // A config change must use the latest rule values, not a saved property snapshot.
     f.niri().config.borrow_mut().window_rules = Config::parse_mem(
@@ -118,6 +126,7 @@ fn manual_sources_survive_rule_changes_and_unset_does_not_remove_dynamic_source(
             tag: "private".into(),
         },
         false,
+        InputTime::now(),
     );
     f.double_roundtrip(id);
     assert_eq!(mapped(&mut f).rules().opacity, None);
@@ -132,8 +141,11 @@ fn remap_preserves_manual_tags_but_rebuilds_dynamic_tags() {
     "#,
         "seed",
     );
-    f.niri_state()
-        .do_action(Action::Tag(TagOperation::Set, "manual".into()), false);
+    f.niri_state().do_action(
+        Action::Tag(TagOperation::Set, "manual".into()),
+        false,
+        InputTime::now(),
+    );
     f.double_roundtrip(id);
     assert_eq!(tags(&mut f), ["dynamic", "manual"]);
     let window = f.client(id).window(&surface);
@@ -161,12 +173,18 @@ fn tag_exclusion_and_exact_matching() {
     "#,
         "ordinary",
     );
-    f.niri_state()
-        .do_action(Action::Tag(TagOperation::Set, "allow-more".into()), false);
+    f.niri_state().do_action(
+        Action::Tag(TagOperation::Set, "allow-more".into()),
+        false,
+        InputTime::now(),
+    );
     f.double_roundtrip(id);
     assert_eq!(mapped(&mut f).rules().opacity, Some(0.5));
-    f.niri_state()
-        .do_action(Action::Tag(TagOperation::Set, "allow".into()), false);
+    f.niri_state().do_action(
+        Action::Tag(TagOperation::Set, "allow".into()),
+        false,
+        InputTime::now(),
+    );
     f.double_roundtrip(id);
     assert_eq!(tags(&mut f), ["allow", "allow-more"]);
     assert_eq!(mapped(&mut f).rules().opacity, None);
@@ -229,7 +247,7 @@ fn by_id_tag_actions_reach_interactively_moved_window() {
             None,
         ),
     ] {
-        f.niri_state().do_action(action, false);
+        f.niri_state().do_action(action, false, InputTime::now());
         f.double_roundtrip(id);
         let mapped = f
             .niri()

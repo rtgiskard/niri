@@ -1,10 +1,11 @@
 use std::os::fd::AsFd as _;
+use std::os::unix::fs::FileExt as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use niri_config::Config;
-use smithay::backend::input::InputEvent;
+use smithay::backend::input::{InputEvent, InputTime};
 use smithay::input::pointer::CursorImageStatus;
 use smithay::reexports::rustix::fs::{ftruncate, memfd_create, MemfdFlags};
 use smithay::reexports::wayland_protocols::ext::foreign_toplevel_list::v1::client::{
@@ -17,14 +18,14 @@ use smithay::reexports::wayland_protocols::ext::image_capture_source::v1::client
     ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1,
 };
 use smithay::reexports::wayland_protocols::ext::image_copy_capture::v1::client::{
-    ext_image_copy_capture_cursor_session_v1::ExtImageCopyCaptureCursorSessionV1,
+    ext_image_copy_capture_cursor_session_v1::{self, ExtImageCopyCaptureCursorSessionV1},
     ext_image_copy_capture_frame_v1::{self, ExtImageCopyCaptureFrameV1},
     ext_image_copy_capture_manager_v1::{ExtImageCopyCaptureManagerV1, Options},
-    ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1,
+    ext_image_copy_capture_session_v1::{self, ExtImageCopyCaptureSessionV1},
 };
 use smithay::utils::Point;
 use wayland_client::protocol::{
-    wl_pointer::WlPointer,
+    wl_pointer::{self, WlPointer},
     wl_shm::{self, WlShm},
     wl_shm_pool::WlShmPool,
 };
@@ -33,6 +34,7 @@ use wayland_client::{Connection, Dispatch, QueueHandle};
 use super::client::{ClientId, State as ClientState};
 use super::test_input_backend::{TestInputBackend, TestPointerAxisEvent};
 use super::Fixture;
+use crate::backend::{Backend, Headless};
 use crate::cursor::RenderCursor;
 use crate::niri::{PointerVisibility, RedrawState};
 
@@ -90,6 +92,266 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, FrameResults> for ClientState {
             _ => (),
         }
     }
+}
+
+type PointerSerial = Arc<Mutex<Option<u32>>>;
+
+impl Dispatch<WlPointer, PointerSerial> for ClientState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlPointer,
+        event: wl_pointer::Event,
+        serial: &PointerSerial,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wl_pointer::Event::Enter { serial: entered, .. } = event {
+            *serial.lock().unwrap() = Some(entered);
+        }
+    }
+}
+
+type CursorHotspots = Arc<Mutex<Vec<(i32, i32)>>>;
+
+impl Dispatch<ExtImageCopyCaptureCursorSessionV1, CursorHotspots> for ClientState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ExtImageCopyCaptureCursorSessionV1,
+        event: ext_image_copy_capture_cursor_session_v1::Event,
+        hotspots: &CursorHotspots,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let ext_image_copy_capture_cursor_session_v1::Event::Hotspot { x, y } = event {
+            hotspots.lock().unwrap().push((x, y));
+        }
+    }
+}
+
+type CaptureSizes = Arc<Mutex<Vec<(u32, u32)>>>;
+
+impl Dispatch<ExtImageCopyCaptureSessionV1, CaptureSizes> for ClientState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ExtImageCopyCaptureSessionV1,
+        event: ext_image_copy_capture_session_v1::Event,
+        sizes: &CaptureSizes,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let ext_image_copy_capture_session_v1::Event::BufferSize { width, height } = event {
+            sizes.lock().unwrap().push((width, height));
+        }
+    }
+}
+
+fn capture_cursor(f: &mut Fixture, output: &smithay::output::Output) {
+    let state = f.niri_state();
+    state
+        .backend
+        .with_primary_renderer(|renderer| {
+            state.niri.render_for_image_copy_cursor_capture(
+                renderer,
+                output,
+                Duration::ZERO,
+            );
+        })
+        .unwrap();
+}
+
+// Session constraints now need a renderer, but the scheduling and fence tests deliberately
+// leave captures pending instead of letting redraw() render and complete them. Install this
+// backend only while creating the session, then restore the original renderer-less backend
+// (including its output/IPC state) before requesting frames.
+fn install_cursor_session_renderer(f: &mut Fixture) -> Backend {
+    let mut backend = Backend::Headless(Headless::new());
+    backend.headless().add_renderer().unwrap();
+    std::mem::replace(&mut f.niri_state().backend, backend)
+}
+
+#[test]
+fn egl_cursor_capture_publishes_hotspot_only_changes_outside_bitmap() {
+    let mut f = Fixture::new();
+    f.add_output(1, (100, 100));
+    f.niri_state().backend.headless().add_renderer().unwrap();
+    let output = f.niri_output(1);
+    output.change_current_state(
+        None,
+        None,
+        Some(smithay::output::Scale::Fractional(1.5)),
+        None,
+    );
+    let id = f.add_client();
+    f.double_roundtrip(id);
+    let source = window_capture_source(&mut f, id);
+    let serial = PointerSerial::default();
+    let hotspots = CursorHotspots::default();
+    let sizes = CaptureSizes::default();
+    let cursor_fd = std::fs::File::from(
+        memfd_create("niri-test-cursor-image", MemfdFlags::CLOEXEC).unwrap(),
+    );
+    let pixels = [0_u8, 0, 255, 255].repeat(12 * 8);
+    ftruncate(&cursor_fd, pixels.len() as u64).unwrap();
+    cursor_fd.write_all_at(&pixels, 0).unwrap();
+    let (pointer, cursor_surface, manager, shm) = {
+        let client = f.client(id);
+        let registry = client.display.get_registry(&client.qh, ());
+        let global = |interface| {
+            client.state.globals.iter().find(|g| g.interface == interface).unwrap().name
+        };
+        let shm: WlShm = registry.bind(global("wl_shm"), 1, &client.qh, ());
+        let manager: ExtImageCopyCaptureManagerV1 = registry.bind(
+            global("ext_image_copy_capture_manager_v1"), 1, &client.qh, (),
+        );
+        let pointer = client.state.seats.keys().next().unwrap()
+            .get_pointer(&client.qh, serial.clone());
+        let cursor_surface = client.state.create_surface();
+        let pool = shm.create_pool(cursor_fd.as_fd(), pixels.len() as i32, &client.qh, ());
+        let buffer = pool.create_buffer(0, 12, 8, 48, wl_shm::Format::Argb8888, &client.qh, ());
+        cursor_surface.attach(Some(&buffer), 0, 0);
+        cursor_surface.damage(0, 0, 12, 8);
+        cursor_surface.commit();
+        (pointer, cursor_surface, manager, shm)
+    };
+    f.niri_state().move_cursor(Point::from((32., 32.)));
+    f.double_roundtrip(id);
+    let serial = serial.lock().unwrap().expect("pointer must enter the captured window");
+    pointer.set_cursor(serial, Some(&cursor_surface), 2, 2);
+    f.double_roundtrip(id);
+
+    let (cursor_session, session) = {
+        let client = f.client(id);
+        let cursor_session = manager.create_pointer_cursor_session(
+            &source, &pointer, &client.qh, hotspots.clone(),
+        );
+        let session = cursor_session.get_capture_session(&client.qh, sizes.clone());
+        (cursor_session, session)
+    };
+    f.double_roundtrip(id);
+    let results = FrameResults::default();
+    let mut previous_pixels = None;
+    for (index, (hotspot, expected)) in [
+        ((2, 2), (3, 3)),
+        ((-4, 10), (-6, 15)),
+        ((3, -3), (4, -5)),
+    ].into_iter().enumerate() {
+        let size = *sizes.lock().unwrap().last().unwrap();
+        let fd = std::fs::File::from(
+            memfd_create("niri-test-cursor-frame", MemfdFlags::CLOEXEC).unwrap(),
+        );
+        let len = size.0 * size.1 * 4;
+        ftruncate(&fd, u64::from(len)).unwrap();
+        let frame = {
+            let client = f.client(id);
+            let pool = shm.create_pool(fd.as_fd(), len as i32, &client.qh, ());
+            let buffer = pool.create_buffer(
+                0, size.0 as i32, size.1 as i32, size.0 as i32 * 4,
+                wl_shm::Format::Argb8888, &client.qh, (),
+            );
+            let frame = session.create_frame(&client.qh, results.clone());
+            frame.attach_buffer(&buffer);
+            frame.capture();
+            frame
+        };
+        f.roundtrip(id);
+        capture_cursor(&mut f, &output);
+        f.double_roundtrip(id);
+        assert_eq!(size, (18, 12));
+        if index > 0 {
+            assert_eq!(results.lock().unwrap().len(), index);
+            assert!(f.niri().image_copy_cursor_sessions[0].pending_frame.is_some());
+            pointer.set_cursor(serial, Some(&cursor_surface), hotspot.0, hotspot.1);
+            f.double_roundtrip(id);
+            capture_cursor(&mut f, &output);
+            f.double_roundtrip(id);
+        }
+        assert_eq!(*results.lock().unwrap(), vec![true; index + 1]);
+        assert_eq!(hotspots.lock().unwrap().last(), Some(&expected));
+        let mut pixels = vec![0; len as usize];
+        fd.read_exact_at(&mut pixels, 0).unwrap();
+        if let Some(previous) = &previous_pixels {
+            assert_eq!(&pixels, previous, "hotspot-only updates must preserve the bitmap");
+        }
+        assert!(pixels.chunks_exact(4).any(|pixel| pixel == [0, 0, 255, 255]));
+        previous_pixels = Some(pixels);
+        frame.destroy();
+        f.roundtrip(id);
+    }
+    session.destroy();
+    cursor_session.destroy();
+    f.roundtrip(id);
+}
+
+#[test]
+fn egl_empty_cursor_capture_keeps_fractional_nominal_size() {
+    let mut config = Config::default();
+    config.cursor.size = 25;
+    let mut f = Fixture::with_config(config);
+    f.add_output(1, (100, 100));
+    f.niri_state().backend.headless().add_renderer().unwrap();
+    let output = f.niri_output(1);
+    output.change_current_state(
+        None,
+        None,
+        Some(smithay::output::Scale::Fractional(1.5)),
+        None,
+    );
+    f.niri().cursor_manager.set_cursor_image(CursorImageStatus::Hidden);
+    let id = f.add_client();
+    f.double_roundtrip(id);
+    let sizes = CaptureSizes::default();
+    let (cursor_session, session, shm) = {
+        let client = f.client(id);
+        let registry = client.display.get_registry(&client.qh, ());
+        let global = |interface| {
+            client.state.globals.iter().find(|g| g.interface == interface).unwrap().name
+        };
+        let source_manager: ExtOutputImageCaptureSourceManagerV1 = registry.bind(
+            global("ext_output_image_capture_source_manager_v1"), 1, &client.qh, (),
+        );
+        let manager: ExtImageCopyCaptureManagerV1 = registry.bind(
+            global("ext_image_copy_capture_manager_v1"), 1, &client.qh, (),
+        );
+        let shm: WlShm = registry.bind(global("wl_shm"), 1, &client.qh, ());
+        let source = source_manager.create_source(
+            client.state.outputs.keys().next().unwrap(), &client.qh, (),
+        );
+        let pointer = client.state.seats.keys().next().unwrap().get_pointer(&client.qh, ());
+        let cursor_session = manager.create_pointer_cursor_session(
+            &source, &pointer, &client.qh, (),
+        );
+        let session = cursor_session.get_capture_session(&client.qh, sizes.clone());
+        (cursor_session, session, shm)
+    };
+    f.double_roundtrip(id);
+    assert_eq!(*sizes.lock().unwrap(), [(38, 38)]);
+    let len = 38 * 38 * 4;
+    let fd = std::fs::File::from(
+        memfd_create("niri-test-empty-cursor", MemfdFlags::CLOEXEC).unwrap(),
+    );
+    ftruncate(&fd, len as u64).unwrap();
+    fd.write_all_at(&vec![255; len as usize], 0).unwrap();
+    let results = FrameResults::default();
+    let frame = {
+        let client = f.client(id);
+        let pool = shm.create_pool(fd.as_fd(), len, &client.qh, ());
+        let buffer = pool.create_buffer(0, 38, 38, 38 * 4, wl_shm::Format::Argb8888, &client.qh, ());
+        let frame = session.create_frame(&client.qh, results.clone());
+        frame.attach_buffer(&buffer);
+        frame.capture();
+        frame
+    };
+    f.roundtrip(id);
+    capture_cursor(&mut f, &output);
+    f.double_roundtrip(id);
+    assert_eq!(*results.lock().unwrap(), [true]);
+    let mut pixels = vec![255; len as usize];
+    fd.read_exact_at(&mut pixels, 0).unwrap();
+    assert!(pixels.iter().all(|&byte| byte == 0));
+    frame.destroy();
+    session.destroy();
+    cursor_session.destroy();
+    f.roundtrip(id);
 }
 
 struct AnimatedTheme(PathBuf);
@@ -358,7 +620,43 @@ fn window_capture_tags_follow_content_sessions_not_cursor_sessions() {
         manager.create_session(&source, Options::empty(), &client.qh, ())
     };
     f.double_roundtrip(id);
-    assert_eq!(tags(&mut f), ["captured"]);
+    assert!(tags(&mut f).is_empty(), "session creation is not a content cast");
+    let size = f.niri().image_copy_sessions[0]
+        .session
+        .current_constraints()
+        .unwrap()
+        .size;
+    let fd = memfd_create("niri-test-window-cast", MemfdFlags::CLOEXEC).unwrap();
+    let len = size.w * size.h * 4;
+    ftruncate(&fd, len as u64).unwrap();
+    let buffer = {
+        let client = f.client(id);
+        let registry = client.display.get_registry(&client.qh, ());
+        let global = client.state.globals.iter().find(|g| g.interface == "wl_shm")
+            .unwrap().name;
+        let shm: WlShm = registry.bind(global, 1, &client.qh, ());
+        let pool = shm.create_pool(fd.as_fd(), len, &client.qh, ());
+        pool.create_buffer(
+            0, size.w, size.h, size.w * 4, wl_shm::Format::Argb8888, &client.qh, (),
+        )
+    };
+    for request in 1..=2 {
+        let frame = {
+            let client = f.client(id);
+            let frame = session.create_frame(&client.qh, ());
+            frame.attach_buffer(&buffer);
+            frame.capture();
+            frame
+        };
+        f.double_roundtrip(id);
+        if request == 1 {
+            assert!(tags(&mut f).is_empty(), "one-shot screenshots are not casts");
+        } else {
+            assert_eq!(tags(&mut f), ["captured"]);
+        }
+        frame.destroy();
+        f.roundtrip(id);
+    }
 
     session.destroy();
     f.double_roundtrip(id);
@@ -398,6 +696,7 @@ fn image_copy_fence_registration_failure_rejects_frame_and_allows_retry() {
     f.add_output(1, (100, 100));
     let id = f.add_client();
     f.double_roundtrip(id);
+    let rendererless_backend = install_cursor_session_renderer(&mut f);
     let (cursor_session, session, shm) = {
         let client = f.client(id);
         let registry = client.display.get_registry(&client.qh, ());
@@ -438,9 +737,12 @@ fn image_copy_fence_registration_failure_rejects_frame_and_allows_retry() {
         (cursor_session, session, shm)
     };
     f.double_roundtrip(id);
-    let output = f.niri_output(1);
-    let size =
-        crate::handlers::image_copy_capture::cursor_capture_constraints(f.niri(), &output).size;
+    f.niri_state().backend = rendererless_backend;
+    let size = f.niri().image_copy_cursor_sessions[0]
+        .session
+        .current_constraints()
+        .unwrap()
+        .size;
     let len = size.w * size.h * 4;
     let fd = memfd_create("niri-test-fence-capture", MemfdFlags::CLOEXEC).unwrap();
     ftruncate(&fd, len as u64).unwrap();
@@ -501,6 +803,7 @@ fn pending_cursor_capture(window_source: bool) {
     let id = f.add_client();
     f.double_roundtrip(id);
     let window_capture_source = window_source.then(|| window_capture_source(&mut f, id));
+    let rendererless_backend = install_cursor_session_renderer(&mut f);
     let (cursor_session, capture_session, shm) = {
         let client = f.client(id);
         let registry = client.display.get_registry(&client.qh, ());
@@ -543,15 +846,18 @@ fn pending_cursor_capture(window_source: bool) {
         (cursor_session, capture_session, shm)
     };
     f.roundtrip(id);
+    f.niri_state().backend = rendererless_backend;
     assert_eq!(f.niri().image_copy_cursor_sessions.len(), 1);
     f.niri().pointer_visibility = PointerVisibility::Hidden;
     tablet_at(&mut f, 2, (50., 50.));
     redraw(&mut f);
     assert_eq!(animation_flags(&mut f), [false, false]);
 
-    let output = f.niri_output(1);
-    let size =
-        crate::handlers::image_copy_capture::cursor_capture_constraints(f.niri(), &output).size;
+    let size = f.niri().image_copy_cursor_sessions[0]
+        .session
+        .current_constraints()
+        .unwrap()
+        .size;
     let fd = memfd_create("niri-test-cursor-capture", MemfdFlags::CLOEXEC).unwrap();
     let len = size.w * size.h * 4;
     ftruncate(&fd, len as u64).unwrap();
@@ -596,6 +902,7 @@ fn pending_cursor_capture(window_source: bool) {
         f.niri_state().do_action(
             niri_config::Action::MoveWindowToMonitor("headless-2".into()),
             false,
+            InputTime::now(),
         );
         f.double_roundtrip(id);
         f.niri_complete_animations();
